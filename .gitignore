@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# App data (user-specific or sensitive)
+cookies.txt
+channels.json
+schedule.json
+videos/
+
+# Local ffmpeg installation
+ffmpeg/bin/
+ffmpeg/doc/
+ffmpeg/include/
+ffmpeg/lib/
+ffmpeg/presets/
+ffmpeg/share/
+
+# OS
+.DS_Store
+Thumbs.db
