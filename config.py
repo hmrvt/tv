@@ -14,7 +14,7 @@ import sys
 #  scene options: "sleeping" | "lunch" | "fixing"
 # ─────────────────────────────────────────────
 OFF_PERIODS = [
-    (12, 0,  12, 3,  "lunch"),
+    (11, 0,  12, 30,  "lunch"),
     (19, 30, 23, 59, "sleeping"),
     (0,  0,   6, 50, "sleeping"),
 ]

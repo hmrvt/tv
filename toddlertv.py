@@ -268,7 +268,7 @@ class ToddlerTV:
     def _show_robots(self, scene: str):
         self.video_frame.place_forget()
         self.robot_canvas.place(relx=0, rely=0, relwidth=1, relheight=0.76)
-        if not self.robot_canvas._animating:
+        if not self.robot_canvas._animating or self.robot_canvas.scene != scene:
             self.robot_canvas.start(scene)
 
     def _hide_robots(self):
