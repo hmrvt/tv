@@ -26,6 +26,10 @@ ffmpeg/include/
 ffmpeg/lib/
 ffmpeg/presets/
 ffmpeg/share/
+ffmpeg/LICENSE
+
+# Dev notes
+Virtual Environments.txt
 
 # OS
 .DS_Store
