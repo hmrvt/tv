@@ -356,6 +356,7 @@ class ToddlerTV:
             "channel_id": channel_id,
             "thumbnail": info.get("thumbnail", ""),
             "_resolved_at": time.time(),
+            "_play_retries": 0,  # Track failed playback attempts
         })
 
         if channel_id and not is_avatar_fetched(channel_id):
@@ -482,9 +483,35 @@ class ToddlerTV:
         resolved_at = video.get("_resolved_at", 0)
         is_remote = stream_url.startswith("http") and "googlevideo" in stream_url
         is_stale = (time.time() - resolved_at) > self.URL_TTL
+        
+        # Track retry attempts for this video
+        retry_count = video.get("_play_retries", 0)
+        max_retries = 3
 
         print(f"[channel {index}] video {video_idx}, seek {offset_secs:.1f}s, "
-              f"{'stale' if is_stale else 'fresh'} URL")
+              f"{'stale' if is_stale else 'fresh'} URL (retry {retry_count})")
+
+        # Skip to next video if this one keeps failing
+        if retry_count >= max_retries:
+            print(f"[channel {index}] Video {video_idx} failed {retry_count} times, marking as failed")
+            video["_failed"] = True
+            # Find next non-failed video
+            next_idx = (video_idx + 1) % len(state.videos)
+            attempts_to_find = 0
+            while attempts_to_find < len(state.videos):
+                if not state.videos[next_idx].get("_failed", False):
+                    # Jump ahead to the next working video by updating elapsed time
+                    print(f"[channel {index}] Skipping to video {next_idx}")
+                    self._start_channel(index)
+                    return
+                next_idx = (next_idx + 1) % len(state.videos)
+                attempts_to_find += 1
+            # All videos are marked failed, reset and try again
+            for v in state.videos:
+                v["_failed"] = False
+            print(f"[channel {index}] All videos failed, resetting")
+            self._start_channel(index)
+            return
 
         if is_remote and is_stale:
             self._show_robots("fixing")
@@ -499,6 +526,7 @@ class ToddlerTV:
                 if info and isinstance(info, dict):
                     video["stream_url"] = info["url"]
                     video["_resolved_at"] = time.time()
+                    video["_play_retries"] = 0  # Reset on successful refresh
                 elif info == "RATE_LIMITED":
                     print(f"[channel {index}] Rate-limited, using existing URL")
                 else:
@@ -549,6 +577,12 @@ class ToddlerTV:
 
         if vlc_state in (vlc.State.Error, vlc.State.Ended):
             print(f"[vlc] Failed to start: {vlc_state}, retrying")
+            # Increment retry counter for current video
+            ch_state = self.states[channel_index]
+            video_idx, _ = ch_state.get_position(self.elapsed())
+            video_idx = min(video_idx, len(ch_state.videos) - 1)
+            if video_idx < len(ch_state.videos):
+                ch_state.videos[video_idx]["_play_retries"] = ch_state.videos[video_idx].get("_play_retries", 0) + 1
             self.root.after(2000, lambda: self._play_video_for_channel(channel_index))
             return
 
@@ -580,6 +614,12 @@ class ToddlerTV:
         vlc_state = self.player.get_state()
         if vlc_state in (vlc.State.Error, vlc.State.Ended):
             print(f"[vlc] Error during seek: {vlc_state}")
+            # Increment retry counter for current video
+            ch_state = self.states[channel_index]
+            video_idx, _ = ch_state.get_position(self.elapsed())
+            video_idx = min(video_idx, len(ch_state.videos) - 1)
+            if video_idx < len(ch_state.videos):
+                ch_state.videos[video_idx]["_play_retries"] = ch_state.videos[video_idx].get("_play_retries", 0) + 1
             self.root.after(2000, lambda: self._play_video_for_channel(channel_index))
             return
 
