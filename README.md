@@ -10,7 +10,6 @@ A simulated live-TV experience for toddlers, running on a media PC. YouTube play
 - **Scheduled off-periods** automatically stop playback and show an animated robot scene (sleeping, lunch break, or "engineers at work"). The toddler cannot override this.
 - **Persistent position** — switching away from a channel and returning resumes exactly where it left off, just like real TV.
 - **Phone remote** — a web interface at `http://<pc-ip>:8080` lets a parent view and edit the off-period schedule from any device on the same Wi-Fi.
-- **Optional pre-download** — videos can be downloaded in advance with `downloader.py` so the app plays from local files with no buffering.
 
 ---
 
@@ -83,17 +82,6 @@ python -m yt_dlp --cookies-from-browser firefox --cookies cookies.txt --skip-dow
 ```
 
 > `cookies.txt` is git-ignored. The app works without it for publicly accessible videos.
-
-**5. (Optional) Pre-download videos**
-
-Download all playlist videos to the local `videos/` folder for instant, buffer-free playback:
-
-```bash
-python downloader.py                      # uses cookies.txt
-python downloader.py --browser firefox   # pulls cookies live from browser
-```
-
-The main app automatically prefers local files over streaming when they exist.
 
 ---
 
@@ -171,7 +159,6 @@ images.py         Thumbnail and channel avatar fetching
 robot_canvas.py   Animated robot scenes (Tkinter canvas)
 robot_editor.py   Interactive animation designer for robot poses
 web_remote.py     Phone-accessible HTTP schedule editor
-downloader.py     Bulk video pre-downloader
 
 tests/
   test_unit.py    Unit tests — pure logic, no network or display
@@ -194,7 +181,6 @@ python -m unittest discover tests/ -v
 1. On startup, all channels begin resolving their playlists in background threads (staggered to avoid YouTube rate-limiting).
 2. Each channel maintains a virtual clock so that switching away and returning resumes at the same position — simulating a live broadcast.
 3. When a streaming URL is older than 5 minutes (YouTube URLs expire), it is silently re-resolved in the background before playback continues.
-4. If a video file exists in the `videos/` folder matching the YouTube video ID, it is used directly instead of streaming.
 
 ---
 
@@ -207,7 +193,7 @@ python -m unittest discover tests/ -v
 
 **"Rate-limited" messages in the console**
 - Normal for large playlists. The app automatically waits and retries.
-- Pre-downloading with `downloader.py` eliminates this entirely.
+- For large playlists, consider using a smaller initial playlist.
 
 **Web remote not reachable from phone**
 - Confirm both devices are on the same Wi-Fi network.

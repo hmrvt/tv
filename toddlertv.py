@@ -10,7 +10,6 @@ Project layout:
   media.py          <- ffmpeg/yt-dlp helpers, ChannelState
   images.py         <- thumbnail & avatar fetching
   robot_canvas.py   <- animated off-screen widget
-  downloader.py     <- optional pre-downloader
   channels.json     <- channel definitions (overrides config.py defaults)
   cookies.txt       <- YouTube cookies for yt-dlp
 """
@@ -500,17 +499,24 @@ class ToddlerTV:
             attempts_to_find = 0
             while attempts_to_find < len(state.videos):
                 if not state.videos[next_idx].get("_failed", False):
-                    # Jump ahead to the next working video by updating elapsed time
                     print(f"[channel {index}] Skipping to video {next_idx}")
-                    self._start_channel(index)
+                    # Advance the clock so get_position() returns next_idx
+                    cur = self.elapsed()
+                    cycle_offset = cur % state.total_duration
+                    advance = state.offsets[next_idx] - cycle_offset
+                    if advance <= 0:
+                        advance += state.total_duration
+                    self.clock._accumulated += advance
+                    self.root.after(0, lambda i=index: self._play_video_for_channel(i))
                     return
                 next_idx = (next_idx + 1) % len(state.videos)
                 attempts_to_find += 1
             # All videos are marked failed, reset and try again
             for v in state.videos:
                 v["_failed"] = False
+                v["_play_retries"] = 0
             print(f"[channel {index}] All videos failed, resetting")
-            self._start_channel(index)
+            self.root.after(0, lambda i=index: self._play_video_for_channel(i))
             return
 
         if is_remote and is_stale:
