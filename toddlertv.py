@@ -439,7 +439,6 @@ class ToddlerTV:
 
     def _start_channel(self, index: int):
         """Begin playing a channel. Shows loading robots until video is ready."""
-        self.clock.pause()
         self.player.stop()
         self.state = AppState.LOADING
         self.current_channel = index
