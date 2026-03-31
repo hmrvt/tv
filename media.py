@@ -19,36 +19,58 @@ def _find_ffmpeg() -> str | None:
     """Return the directory containing ffmpeg/ffmpeg.exe, or None."""
     import shutil
 
-    # 1. Check if ffmpeg is already on PATH
-    which_result = shutil.which("ffmpeg")
-    if which_result:
-        found = os.path.dirname(os.path.abspath(which_result))
-        return found
+    def _can_run(directory: str) -> bool:
+        """Return True if ffmpeg in the given directory actually executes."""
+        exe = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+        path = os.path.join(directory, exe)
+        try:
+            result = subprocess.run(
+                [path, "-version"],
+                capture_output=True,
+                timeout=5,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
 
-    # 2. Check common subdirectories relative to the app
     app_dir = os.getcwd()
     exe = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
-    candidates = [
-        os.path.join(app_dir, "ffmpeg"),          # ./ffmpeg/
+
+    # 1. Prefer project-local ffmpeg (has DLLs alongside it)
+    local_candidates = [
         os.path.join(app_dir, "ffmpeg", "bin"),    # ./ffmpeg/bin/
+        os.path.join(app_dir, "ffmpeg"),            # ./ffmpeg/
         app_dir,                                    # ./
     ]
 
+    for d in local_candidates:
+        if os.path.isfile(os.path.join(d, exe)) and _can_run(d):
+            return d
+
+    # 2. Check PATH, but verify it actually works (DLLs may be missing)
+    which_result = shutil.which("ffmpeg")
+    if which_result:
+        found = os.path.dirname(os.path.abspath(which_result))
+        if _can_run(found):
+            return found
+        print(f"[ffmpeg] Found on PATH: {found}")
+        print(f"[ffmpeg] Note: ffmpeg.exe exits with code 3221225781 (may be missing DLLs — yt-dlp will fall back to HLS streams)")
+
     # 3. Platform-specific system paths
+    system_candidates: list[str] = []
     if sys.platform == "win32":
-        candidates += [
+        system_candidates = [
             r"C:\ffmpeg\bin",
             r"C:\Program Files\ffmpeg\bin",
             os.path.join(os.environ.get("LOCALAPPDATA", ""), "ffmpeg", "bin"),
         ]
     elif sys.platform == "darwin":
-        candidates += ["/usr/local/bin", "/opt/homebrew/bin"]
+        system_candidates = ["/usr/local/bin", "/opt/homebrew/bin"]
     else:
-        candidates += ["/usr/bin", "/usr/local/bin", "/snap/bin"]
+        system_candidates = ["/usr/bin", "/usr/local/bin", "/snap/bin"]
 
-    for d in candidates:
-        full_path = os.path.join(d, exe)
-        if os.path.isfile(full_path):
+    for d in system_candidates:
+        if os.path.isfile(os.path.join(d, exe)) and _can_run(d):
             return d
 
     return None
