@@ -30,6 +30,7 @@ ffmpeg/LICENSE
 
 # Dev notes
 Virtual Environments.txt
+downloader.py
 
 # OS
 .DS_Store
