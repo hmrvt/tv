@@ -110,7 +110,7 @@ class TestChannelState(unittest.TestCase):
         s = ChannelState()
         for i, d in enumerate(durations):
             s.videos.append({"stream_url": f"http://v{i}", "duration": d})
-        s._rebuild_offsets()
+        s.advance_video(0.0)
         return s
 
     # ── get_position ──────────────────────────────────────────────────────────
@@ -133,49 +133,62 @@ class TestChannelState(unittest.TestCase):
         self.assertEqual(idx, 0)
         self.assertAlmostEqual(off, 300.0)
 
-    def test_single_video_wraps(self):
+    def test_single_video_offset_grows_past_duration(self):
         s = self._state([600])
-        idx, off = s.get_position(600)   # one full loop → back to start
+        idx, off = s.get_position(600)
         self.assertEqual(idx, 0)
-        self.assertAlmostEqual(off, 0.0, places=1)
+        self.assertAlmostEqual(off, 600.0)
 
     def test_multi_video_first(self):
         s = self._state([300, 600, 900])
         idx, off = s.get_position(100)
-        self.assertEqual(idx, 0)
+        self.assertIn(idx, [0, 1, 2])
         self.assertAlmostEqual(off, 100.0)
 
-    def test_multi_video_second(self):
+    def test_advance_moves_to_next_video(self):
         s = self._state([300, 600, 900])
-        idx, off = s.get_position(400)   # 300 into first + 100 into second
-        self.assertEqual(idx, 1)
-        self.assertAlmostEqual(off, 100.0)
+        first_idx, _ = s.get_position(0)
+        s.advance_video(300)
+        second_idx, off = s.get_position(350)
+        self.assertNotEqual(first_idx, second_idx)
+        self.assertAlmostEqual(off, 50.0)
 
-    def test_multi_video_third(self):
+    def test_advance_twice_reaches_third_video(self):
         s = self._state([300, 600, 900])
-        idx, off = s.get_position(1000)  # 300+600=900, then 100s into third
-        self.assertEqual(idx, 2)
+        first_idx, _ = s.get_position(0)
+        s.advance_video(300)
+        second_idx, _ = s.get_position(300)
+        s.advance_video(900)
+        third_idx, off = s.get_position(1000)
+        self.assertNotIn(third_idx, [first_idx, second_idx])
         self.assertAlmostEqual(off, 100.0)
 
-    def test_position_wraps_across_all_videos(self):
-        s = self._state([300, 600])     # total = 900
-        idx, off = s.get_position(900)  # back to start
-        self.assertEqual(idx, 0)
-        self.assertAlmostEqual(off, 0.0, places=1)
+    def test_queue_reshuffles_after_all_videos_played(self):
+        s = self._state([300, 600])
+        seen = set()
+        for i in range(2):
+            idx, _ = s.get_position(i * 300)
+            seen.add(idx)
+            s.advance_video(i * 300)
+        self.assertEqual(seen, {0, 1})
+        # Queue should refill — next advance still works
+        s.advance_video(600)
+        idx, _ = s.get_position(600)
+        self.assertIn(idx, [0, 1])
 
-    # ── _rebuild_offsets ──────────────────────────────────────────────────────
+    # ── queue membership ──────────────────────────────────────────────────────
 
-    def test_offsets_and_total_duration(self):
+    def test_all_videos_in_initial_queue(self):
         s = self._state([100, 200, 300])
-        self.assertEqual(s.offsets, [0.0, 100.0, 300.0])
-        self.assertAlmostEqual(s.total_duration, 600.0)
+        # All 3 indices must be scheduled (current + 2 remaining)
+        queued = {s._current_idx} | set(s._unplayed)
+        self.assertEqual(queued, {0, 1, 2})
 
-    def test_rebuild_reflects_added_video(self):
+    def test_queue_new_video_inserted_into_unplayed(self):
         s = self._state([100, 200])
         s.videos.append({"stream_url": "http://v2", "duration": 300})
-        s._rebuild_offsets()
-        self.assertAlmostEqual(s.total_duration, 600.0)
-        self.assertEqual(len(s.offsets), 3)
+        s.queue_new_video(2)
+        self.assertIn(2, s._unplayed)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

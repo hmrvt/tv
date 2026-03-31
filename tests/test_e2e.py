@@ -289,14 +289,16 @@ class TestChannelResolutionWorkflow(unittest.TestCase):
         })
         if not state.ready:
             state.ready = True
-        state._rebuild_offsets()
+        if not state._initialized:
+            state.advance_video(0.0)
+        else:
+            state.queue_new_video(len(state.videos) - 1)
 
     def test_single_video_ready_after_resolve(self):
         state = ChannelState()
         self._add(state, _FAKE_INFO, "https://www.youtube.com/watch?v=abc")
         self.assertTrue(state.ready)
         self.assertEqual(len(state.videos), 1)
-        self.assertAlmostEqual(state.total_duration, 600.0)
 
     def test_position_mid_first_video(self):
         state = ChannelState()
@@ -310,17 +312,22 @@ class TestChannelResolutionWorkflow(unittest.TestCase):
         for i, dur in enumerate([300.0, 600.0, 900.0]):
             self._add(state, {**_FAKE_INFO, "duration": dur}, f"url{i}")
 
-        # total = 1800s; at 350s → past first (300s), 50s into second
-        self.assertAlmostEqual(state.total_duration, 1800.0)
-        idx, off = state.get_position(350.0)
-        self.assertEqual(idx, 1)
-        self.assertAlmostEqual(off, 50.0)
+        # At elapsed=0, we're on the first queued video with offset 0
+        idx, off = state.get_position(0.0)
+        self.assertIn(idx, [0, 1, 2])
+        self.assertAlmostEqual(off, 0.0)
+        # After advancing, offset resets relative to new start time
+        state.advance_video(300.0)
+        idx2, off2 = state.get_position(350.0)
+        self.assertNotEqual(idx2, idx)
+        self.assertAlmostEqual(off2, 50.0)
 
     def test_position_wraps_back_to_start(self):
         state = ChannelState()
         self._add(state, _FAKE_INFO, "url0")
-        idx, off = state.get_position(600.0)   # exactly one full loop
-        self.assertEqual(idx, 0)
+        # After advance, new video starts at that elapsed time
+        state.advance_video(600.0)
+        idx, off = state.get_position(600.0)
         self.assertAlmostEqual(off, 0.0, places=1)
 
     def test_rate_limited_sentinel_skips_video(self):
@@ -544,7 +551,7 @@ class TestAppStateMachine(unittest.TestCase):
                 "duration":     600,
                 "_resolved_at": time.time(),
             }]
-            self.app.states[1]._rebuild_offsets()
+            self.app.states[1].advance_video(0.0)
             self.app.switch_channel(1)
         self.assertEqual(self.app.state, self._tt.AppState.LOADING)
         self.assertEqual(self.app.current_channel, 1)
@@ -583,7 +590,7 @@ class TestAppStateMachine(unittest.TestCase):
             "duration":     600,
             "_resolved_at": time.time() - (self.app.URL_TTL + 10),  # deliberately stale
         }]
-        self.app.states[0]._rebuild_offsets()
+        self.app.states[0].advance_video(0.0)
 
         # Prevent the background thread from calling back into tkinter (not
         # thread-safe) after tearDown destroys the root.
@@ -608,7 +615,7 @@ class TestAppStateMachine(unittest.TestCase):
             "duration":     600,
             "_resolved_at": time.time(),
         }]
-        self.app.states[0]._rebuild_offsets()
+        self.app.states[0].advance_video(0.0)
 
         with patch.object(self.app, "_vlc_play") as mock_play:
             self.app._play_video_for_channel(0)

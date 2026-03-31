@@ -333,8 +333,7 @@ class ToddlerTV:
             self._add_video(state, index, info, yt_url)
 
         state.resolving = False
-        print(f"[channel {index}] Resolved: {len(state.videos)} ready, "
-              f"{len(state.pending_urls)} pending")
+        print(f"[CH{index + 1}] {len(state.videos)} resolved, {len(state.pending_urls)} pending")
 
         # If all channels are done resolving (even if some failed), exit boot
         if self.state == AppState.BOOTING:
@@ -363,12 +362,14 @@ class ToddlerTV:
                 target=fetch_channel_avatar, args=(channel_id,), daemon=True
             ).start()
 
-        was_ready = state.ready
+        title = info.get("title", yt_url)
+        duration = info["duration"]
+        print(f"[CH{index + 1}] + \"{title}\" ({duration:.0f}s)")
+
         if not state.ready:
             state.ready = True
-            print(f"[channel {index}] Ready")
 
-        state._rebuild_offsets()
+        state.queue_new_video(len(state.videos) - 1)
 
         # During boot, wait until ALL channels have at least one video
         # so the buttons can show avatars before we start playing.
@@ -417,8 +418,7 @@ class ToddlerTV:
         state = self.states[index]
         if state.resolving or not state.pending_urls or not state.videos:
             return
-        video_idx, _ = state.get_position(self.elapsed())
-        videos_ahead = len(state.videos) - 1 - video_idx
+        videos_ahead = len(state._unplayed)
         if videos_ahead <= self.LOOKAHEAD:
             threading.Thread(
                 target=self._resolve_more, args=(index,), daemon=True
@@ -473,6 +473,8 @@ class ToddlerTV:
             return
 
         state = self.states[index]
+        if not state._initialized:
+            state.advance_video(self.elapsed())
         video_idx, offset_secs = state.get_position(self.elapsed())
         video_idx = min(video_idx, len(state.videos) - 1)
         video = state.videos[video_idx]
@@ -487,35 +489,23 @@ class ToddlerTV:
         retry_count = video.get("_play_retries", 0)
         max_retries = 3
 
-        print(f"[channel {index}] video {video_idx}, seek {offset_secs:.1f}s, "
-              f"{'stale' if is_stale else 'fresh'} URL (retry {retry_count})")
+        title = video.get("title") or video["yt_url"]
+        stale_tag = " [stale]" if is_stale else ""
+        retry_tag = f" retry {retry_count}" if retry_count else ""
+        print(f"[CH{index + 1}] ▶ \"{title}\" +{offset_secs:.0f}s{stale_tag}{retry_tag}")
 
         # Skip to next video if this one keeps failing
         if retry_count >= max_retries:
-            print(f"[channel {index}] Video {video_idx} failed {retry_count} times, marking as failed")
+            print(f"[CH{index + 1}] skip \"{title}\" (failed {retry_count}x)")
             video["_failed"] = True
-            # Find next non-failed video
-            next_idx = (video_idx + 1) % len(state.videos)
-            attempts_to_find = 0
-            while attempts_to_find < len(state.videos):
-                if not state.videos[next_idx].get("_failed", False):
-                    print(f"[channel {index}] Skipping to video {next_idx}")
-                    # Advance the clock so get_position() returns next_idx
-                    cur = self.elapsed()
-                    cycle_offset = cur % state.total_duration
-                    advance = state.offsets[next_idx] - cycle_offset
-                    if advance <= 0:
-                        advance += state.total_duration
-                    self.clock._accumulated += advance
-                    self.root.after(0, lambda i=index: self._play_video_for_channel(i))
-                    return
-                next_idx = (next_idx + 1) % len(state.videos)
-                attempts_to_find += 1
-            # All videos are marked failed, reset and try again
-            for v in state.videos:
-                v["_failed"] = False
-                v["_play_retries"] = 0
-            print(f"[channel {index}] All videos failed, resetting")
+            state._unplayed = [i for i in state._unplayed
+                               if not state.videos[i].get("_failed", False)]
+            if all(v.get("_failed", False) for v in state.videos):
+                for v in state.videos:
+                    v["_failed"] = False
+                    v["_play_retries"] = 0
+                print(f"[channel {index}] All videos failed, resetting")
+            state.advance_video(self.elapsed())
             self.root.after(0, lambda i=index: self._play_video_for_channel(i))
             return
 
@@ -647,7 +637,6 @@ class ToddlerTV:
         self.clock.resume()
         self.state = AppState.PLAYING
         self._maybe_resolve_ahead(self.current_channel)
-        print(f"[playing] Channel {self.current_channel} live")
 
     # ─────────────────────────────────────────
     #  VLC POLL (video end / error recovery)
@@ -658,16 +647,31 @@ class ToddlerTV:
             vlc_state = self.player.get_state()
             if vlc_state in (vlc.State.Ended, vlc.State.Error, vlc.State.Stopped):
                 print(f"[poll] VLC {vlc_state}, restarting channel")
-                # Mark URL as stale for re-resolve
                 index = self.current_channel
                 ch_state = self.states[index]
                 if ch_state.videos:
                     video_idx, _ = ch_state.get_position(self.elapsed())
                     video_idx = min(video_idx, len(ch_state.videos) - 1)
                     ch_state.videos[video_idx]["_resolved_at"] = 0
+                    if vlc_state == vlc.State.Ended:
+                        ch_state.advance_video(self.elapsed())
                 self._start_channel(index)
             else:
                 self._maybe_resolve_ahead(self.current_channel)
+
+        # Advance inactive channels whose current video has ended by elapsed time
+        elapsed = self.elapsed()
+        for i, ch_state in enumerate(self.states):
+            if i == self.current_channel or not ch_state.videos:
+                continue
+            if not ch_state._initialized:
+                ch_state.advance_video(elapsed)
+                self._maybe_resolve_ahead(i)
+                continue
+            video = ch_state.videos[ch_state._current_idx]
+            if elapsed - ch_state._video_start_elapsed >= video["duration"]:
+                ch_state.advance_video(elapsed)
+                self._maybe_resolve_ahead(i)
 
         self.root.after(1000, self._poll_vlc)
 
@@ -841,7 +845,7 @@ class ToddlerTV:
         duration = video["duration"] or 1
         progress = min(1.0, offset / duration)
         remaining = duration - offset
-        next_idx = (video_idx + 1) % len(ch_state.videos)
+        next_idx = ch_state._unplayed[0] if ch_state._unplayed else video_idx
         next_video = ch_state.videos[next_idx]
 
         # Current avatar (centered)

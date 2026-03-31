@@ -110,7 +110,7 @@ class ToddlerTestCase(unittest.TestCase):
                 "duration":     1200.0,
                 "_resolved_at": time.time(),
             }]
-            state._rebuild_offsets()
+            state.advance_video(0.0)
 
         self.app.state = AppState.PLAYING
 

@@ -19,53 +19,43 @@ from media import ChannelState
 
 
 def demo_timer_sync():
-    """Demonstrate that all timers progress together."""
-    
     print("=" * 70)
-    print("TIMER SYNCHRONIZATION DEMO")
+    print("QUEUE-BASED PLAYLIST DEMO")
     print("=" * 70)
     print()
-    
-    # Create channel states for 3 channels
+
     channels = [ChannelState() for _ in range(3)]
-    
-    # Add videos to each channel
+
     for ch_idx, ch in enumerate(channels):
         for i in range(3):
             ch.videos.append({
-                "duration": 100,  # 100 seconds each
+                "duration": 100,
                 "title": f"Channel {ch_idx + 1} - Video {i + 1}",
             })
-        ch._rebuild_offsets()
-    
-    print(f"Created 3 channels, each with 3 videos (100s each = 300s total)")
+        ch.advance_video(0.0)
+
+    print("Initial state (elapsed=0):")
+    for ch_idx, ch in enumerate(channels):
+        idx, off = ch.get_position(0)
+        print(f"  CH{ch_idx + 1}: playing video {idx + 1}, offset {off:.1f}s")
+
     print()
-    
-    # Simulate elapsed time progression
-    elapsed_times = [0, 50, 100, 150, 200, 250, 300, 350]
-    
-    print("Elapsed Time | CH1 Position | CH2 Position | CH3 Position")
-    print("-" * 70)
-    
-    for elapsed in elapsed_times:
-        positions = []
-        for ch_idx, ch in enumerate(channels):
-            video_idx, offset = ch.get_position(elapsed)
-            positions.append(f"V{video_idx + 1}:{offset:05.1f}s")
-        
-        print(f"{elapsed:11.0f}s | {positions[0]:12s} | {positions[1]:12s} | {positions[2]:12s}")
-    
+    print("After 50s (mid-video):")
+    for ch_idx, ch in enumerate(channels):
+        idx, off = ch.get_position(50)
+        print(f"  CH{ch_idx + 1}: playing video {idx + 1}, offset {off:.1f}s")
+
     print()
-    print("OBSERVATION: All channels advance through their playlists")
-    print("at the SAME RATE based on global elapsed time, even though")
-    print("only one channel is actively displayed.")
+    print("Video ends on each channel at elapsed=100s — advancing queue:")
+    for ch_idx, ch in enumerate(channels):
+        ch.advance_video(100.0)
+    for ch_idx, ch in enumerate(channels):
+        idx, off = ch.get_position(100)
+        print(f"  CH{ch_idx + 1}: now playing video {idx + 1}, offset {off:.1f}s")
+
     print()
-    print("BEFORE FIX: Clock would pause during channel switching,")
-    print("            causing timers to appear frozen for other channels.")
-    print()
-    print("AFTER FIX:  Clock continues running, so all timers")
-    print("            advance together continuously.")
-    print()
+    print("Each channel is on a different (shuffled) video from its queue.")
+    print("No video repeats until all 3 have been played.")
     print("=" * 70)
 
 

@@ -23,7 +23,6 @@ def _find_ffmpeg() -> str | None:
     which_result = shutil.which("ffmpeg")
     if which_result:
         found = os.path.dirname(os.path.abspath(which_result))
-        print(f"[ffmpeg] Found on PATH: {found}")
         return found
 
     # 2. Check common subdirectories relative to the app
@@ -49,23 +48,17 @@ def _find_ffmpeg() -> str | None:
 
     for d in candidates:
         full_path = os.path.join(d, exe)
-        exists = os.path.isfile(full_path)
-        print(f"[ffmpeg] Checking {full_path} -> {'FOUND' if exists else 'no'}")
-        if exists:
+        if os.path.isfile(full_path):
             return d
 
-    print("[ffmpeg] WARNING: ffmpeg not found anywhere")
     return None
 
 
 FFMPEG_LOCATION = _find_ffmpeg()
 
-# Add ffmpeg to the current process PATH so all child processes inherit it.
 if FFMPEG_LOCATION and FFMPEG_LOCATION not in os.environ.get("PATH", ""):
     os.environ["PATH"] = FFMPEG_LOCATION + os.pathsep + os.environ.get("PATH", "")
-    print(f"[ffmpeg] Added {FFMPEG_LOCATION} to PATH")
 
-# Verify ffmpeg works (informational only — yt-dlp handles its own detection)
 if FFMPEG_LOCATION:
     exe = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
     ffmpeg_bin = os.path.join(FFMPEG_LOCATION, exe)
@@ -77,14 +70,13 @@ if FFMPEG_LOCATION:
         if result.returncode == 0:
             output = (result.stdout or result.stderr or b"").decode("utf-8", errors="replace")
             version_line = output.strip().split("\n")[0] if output.strip() else ""
-            print(f"[ffmpeg] OK: {version_line or ffmpeg_bin}")
+            print(f"[ffmpeg] {version_line or ffmpeg_bin}")
         else:
-            print(f"[ffmpeg] Note: {exe} exits with code {result.returncode} "
-                  f"(may be missing DLLs — yt-dlp will fall back to HLS streams)")
+            print(f"[ffmpeg] WARNING: exits with code {result.returncode} — will fall back to HLS")
     except Exception as e:
-        print(f"[ffmpeg] Note: cannot run {exe}: {e}")
+        print(f"[ffmpeg] WARNING: cannot run: {e}")
 else:
-    print("[ffmpeg] Not found (yt-dlp will use HLS streams)")
+    print("[ffmpeg] Not found — will use HLS streams")
 
 
 # ─────────────────────────────────────────────
@@ -226,8 +218,7 @@ def get_video_info(youtube_url: str) -> dict | None:
         return {"url": local, "duration": duration, "title": title,
                 "channel": channel, "thumbnail": thumbnail, "channel_id": channel_id}
 
-    print(f"[yt-dlp] Streaming: {youtube_url}")
-    print(f"[yt-dlp] Python: {sys.executable}")
+    print(f"[resolve] {youtube_url}")
     try:
         result = subprocess.run(
             [
@@ -260,7 +251,6 @@ def get_video_info(youtube_url: str) -> dict | None:
             return "RATE_LIMITED"
 
         output = result.stdout.strip()
-        print(f"[yt-dlp] raw output: {output[:100]}")
         parts = output.split("|||")
         if len(parts) < 2:
             return None
@@ -287,26 +277,40 @@ def get_video_info(youtube_url: str) -> dict | None:
 class ChannelState:
     def __init__(self):
         self.videos: list[dict] = []
-        self.offsets: list[float] = []
-        self.total_duration: float = 0
         self.resolving = False
         self.ready = False
-        self.pending_urls: list[str] = []  # URLs not yet resolved
+        self.pending_urls: list[str] = []
+        self._current_idx: int = 0
+        self._video_start_elapsed: float = 0.0
+        self._unplayed: list[int] = []
+        self._initialized: bool = False
 
-    def _rebuild_offsets(self):
-        """Recompute cumulative offsets from current video list."""
-        cumulative = 0.0
-        self.offsets = []
-        for v in self.videos:
-            self.offsets.append(cumulative)
-            cumulative += v["duration"]
-        self.total_duration = cumulative
+    def _refill_queue(self):
+        """Shuffle all video indices into the unplayed queue."""
+        indices = list(range(len(self.videos)))
+        random.shuffle(indices)
+        self._unplayed = indices
+
+    def advance_video(self, elapsed: float):
+        """Move to the next video in the queue. Refills and reshuffles when exhausted."""
+        if not self.videos:
+            return
+        if not self._unplayed:
+            self._refill_queue()
+            if self._initialized:
+                print(f"[playlist] Cycle complete — reshuffled {len(self.videos)} videos")
+        self._current_idx = self._unplayed.pop(0)
+        self._video_start_elapsed = elapsed
+        self._initialized = True
+
+    def queue_new_video(self, index: int):
+        """Insert a newly-resolved video into the current cycle's unplayed queue."""
+        if self._initialized:
+            insert_at = random.randint(0, len(self._unplayed))
+            self._unplayed.insert(insert_at, index)
 
     def get_position(self, elapsed: float) -> tuple[int, float]:
-        if not self.videos or self.total_duration == 0:
+        if not self.videos or not self._initialized:
             return 0, 0.0
-        elapsed = elapsed % self.total_duration
-        for i, start in enumerate(self.offsets):
-            if elapsed < start + self.videos[i]["duration"]:
-                return i, elapsed - start
-        return 0, 0.0
+        offset = max(0.0, elapsed - self._video_start_elapsed)
+        return self._current_idx, offset
