@@ -178,20 +178,35 @@ class TestWebRemoteServer(unittest.TestCase):
 
     # ── HTTP helpers ──────────────────────────────────────────────────────────
 
+    @classmethod
+    def _auth_header(cls) -> str:
+        """Base64-encoded Basic Auth credential for the current boot password."""
+        import base64
+        import web_remote as _wr
+        return "Basic " + base64.b64encode(
+            f"admin:{_wr._BOOT_PASSWORD}".encode()
+        ).decode()
+
     def _get(self):
+        import web_remote as _wr
         conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
-        conn.request("GET", "/")
+        conn.request("GET", "/", headers={"Authorization": self._auth_header()})
         resp = conn.getresponse()
         body = resp.read().decode("utf-8")
         conn.close()
         return resp.status, body
 
     def _post(self, body: str):
+        import web_remote as _wr
+        # Inject the CSRF token unless the caller already provided one.
+        if "csrf=" not in body:
+            body = body + f"&csrf={_wr._CSRF_TOKEN}"
         data = body.encode("utf-8")
         conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
         conn.request("POST", "/", data, {
             "Content-Type":   "application/x-www-form-urlencoded",
             "Content-Length": str(len(data)),
+            "Authorization":  self._auth_header(),
         })
         resp = conn.getresponse()
         html = resp.read().decode("utf-8")
