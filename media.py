@@ -5,6 +5,7 @@ ffmpeg detection, yt-dlp wrappers, and ChannelState.
 
 import os
 import sys
+import json
 import random
 import subprocess
 
@@ -249,11 +250,11 @@ def get_video_info(youtube_url: str) -> dict | None:
                 "--js-runtimes", "node",
                 "--remote-components", "ejs:github",
                 *_ffmpeg_args(),
-                # "best" selects the highest quality pre-muxed format (single URL).
-                # VLC needs a single URL — it can't play merged video+audio streams.
-                # This typically gives 720p with audio, or an HLS manifest.
-                "--format", "best",
-                "--print", "%(url)s|||%(duration)s|||%(title)s|||%(channel)s|||%(thumbnail)s|||%(channel_id)s",
+                # Prefer 1080p video-only + separate audio so VLC can play via
+                # input-slave. Falls back to best pre-muxed if unavailable.
+                "--format", "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best",
+                "--dump-single-json",
+                "--no-warnings",
                 youtube_url,
             ],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
@@ -262,7 +263,6 @@ def get_video_info(youtube_url: str) -> dict | None:
         )
         stderr_text = result.stderr or ""
         for line in stderr_text.splitlines():
-            # Skip known cosmetic warnings
             if "ffmpeg not found" in line or "best pre-merged format" in line:
                 continue
             if "ERROR" in line or "WARNING" in line:
@@ -272,20 +272,27 @@ def get_video_info(youtube_url: str) -> dict | None:
         if "rate-limited" in stderr_text or "try again later" in stderr_text.lower():
             return "RATE_LIMITED"
 
-        output = result.stdout.strip()
-        parts = output.split("|||")
-        if len(parts) < 2:
-            return None
-        stream_url = parts[0]
-        if not stream_url.startswith("http"):
+        info = json.loads(result.stdout.strip())
+        requested = info.get("requested_formats", [])
+        if len(requested) >= 2:
+            video_url = requested[0].get("url", "")
+            audio_url = requested[1].get("url")
+            height    = requested[0].get("height", "?")
+            print(f"[resolve] {height}p video + separate audio")
+        else:
+            video_url = info.get("url", "")
+            audio_url = None
+
+        if not video_url.startswith("http"):
             return None
         return {
-            "url":        stream_url,
-            "duration":   float(parts[1]) if parts[1].strip() else 0,
-            "title":      parts[2].strip() if len(parts) > 2 else "Unknown",
-            "channel":    parts[3].strip() if len(parts) > 3 else "",
-            "thumbnail":  parts[4].strip() if len(parts) > 4 else "",
-            "channel_id": parts[5].strip() if len(parts) > 5 else "",
+            "url":        video_url,
+            "audio_url":  audio_url,
+            "duration":   float(info.get("duration") or 0),
+            "title":      info.get("title", "Unknown"),
+            "channel":    info.get("channel", ""),
+            "thumbnail":  info.get("thumbnail", ""),
+            "channel_id": info.get("channel_id", ""),
         }
     except Exception as e:
         print(f"[yt-dlp] Error: {e}")

@@ -11,7 +11,7 @@ import sys
 #  OFF SCHEDULE  ← edit this!
 #
 #  Each entry: (start_hour, start_min, end_hour, end_min, scene)
-#  scene options: "sleeping" | "lunch" | "fixing"
+#  scene options: "sleeping" | "lunch" | "fixing" | "kita_goodbye"
 # ─────────────────────────────────────────────
 OFF_PERIODS = [
     (11, 0,  12, 30,  "lunch"),
@@ -23,9 +23,10 @@ OFF_PERIODS = [
 #  SCENE LABELS (shown on the off-screen animation)
 # ─────────────────────────────────────────────
 SCENES = {
-    "sleeping": {"label": "ROBOTS SLEEPING",  "msg": "TV is resting...", "sub": "come back later!"},
-    "lunch":    {"label": "LUNCH BREAK",       "msg": "Taking a break!",  "sub": "back soon..."},
-    "fixing":   {"label": "ENGINEERS AT WORK", "msg": "Fixing things up!","sub": "almost ready..."},
+    "sleeping":      {"label": "ROBOTS SLEEPING",    "msg": "TV is resting...",    "sub": "come back later!"},
+    "lunch":         {"label": "LUNCH BREAK",         "msg": "Taking a break!",     "sub": "back soon..."},
+    "fixing":        {"label": "ENGINEERS AT WORK",   "msg": "Fixing things up!",   "sub": "almost ready..."},
+    "kita_goodbye":  {"label": "HAVE FUN AT KITA! 🎒", "msg": "See you later!",     "sub": "learning & playing..."},
 }
 
 # ─────────────────────────────────────────────

@@ -911,8 +911,107 @@ class RobotCanvas(tk.Canvas):
             self._scene_sleeping(cx, cy, f)
         elif s == "lunch":
             self._scene_lunch(cx, cy, f)
+        elif s == "kita_goodbye":
+            self._scene_kita_goodbye(cx, cy, f)
         else:
             self._scene_fixing(cx, cy, f)
+
+    # ── Scene: kita_goodbye ────────────────────
+
+    def _scene_kita_goodbye(self, cx, cy, f):
+        """Two robots cheering and waving goodbye as the child heads to Kita."""
+        bob = math.sin(f * 0.07) * 4
+
+        # ── Sunrise ──────────────────────────────────────────────────────
+        sr = 72
+        sy = cy - 5   # sun centre
+        self.create_oval(cx - sr, sy - sr, cx + sr, sy + sr,
+                         fill="#FF8C42", outline="#FFD93D", width=3)
+        for i in range(10):
+            ang = math.radians(i * 36 + f * 0.35)
+            inn = sr + 6
+            out = sr + 22 + 7 * math.sin(f * 0.07 + i * 0.9)
+            self.create_line(
+                cx + math.cos(ang) * inn, sy + math.sin(ang) * inn,
+                cx + math.cos(ang) * out, sy + math.sin(ang) * out,
+                fill="#FFD93D", width=2,
+            )
+        self.create_text(cx, sy + 4, text="☀",
+                         fill="#fff3aa", font=("Courier New", 20, "bold"), anchor="center")
+
+        # ── Floating school bag ───────────────────────────────────────────
+        bag_y = cy - 108 + math.sin(f * 0.05) * 10
+        self.create_text(cx, bag_y, text="🎒", font=("", 28), anchor="center")
+
+        # ── Orbiting sparkle emojis ───────────────────────────────────────
+        sparkles = ["⭐", "💛", "🌟", "✨", "💚"]
+        for i, em in enumerate(sparkles):
+            ang   = math.radians(i * 72 + f * 2.0)
+            orb_r = 95 + 10 * math.sin(f * 0.04 + i)
+            ex = cx + math.cos(ang) * orb_r
+            ey = cy - 30 + math.sin(ang) * 38
+            self.create_text(ex, ey, text=em, font=("", 11), anchor="center")
+
+        # ── "HAVE FUN AT KITA!" banner ────────────────────────────────────
+        bw = 158
+        by = cy - 40
+        banner_bob = math.sin(f * 0.09) * 3
+        # Drop shadow
+        self.create_rectangle(cx - bw + 3, by - 16 + 3, cx + bw + 3, by + 16 + 3,
+                               fill="#000033", outline="")
+        self.create_rectangle(cx - bw, by - 16, cx + bw, by + 16,
+                               fill="#1a004e", outline="#FFD93D", width=2)
+        self.create_text(cx, by + banner_bob, text="HAVE FUN AT KITA!",
+                         fill="#FFD93D", font=("Courier New", 13, "bold"), anchor="center")
+        # Pennant triangles along the top of the banner
+        for px in range(-bw + 8, bw, 22):
+            py_bob = math.sin(px * 0.05 + f * 0.08) * 4
+            col_idx = int((px + bw) / 22) % 3
+            pcol = ["#FF6B6B", "#4ECDC4", "#FFD93D"][col_idx]
+            self.create_text(cx + px, by - 25 + py_bob, text="▼",
+                             fill=pcol, font=("Courier New", 9), anchor="center")
+
+        # ── Confetti rain (frame-deterministic, no random()) ─────────────
+        confetti_cols = ["#FF6B6B", "#FFD93D", "#4ECDC4", "#6BCB77", "#cc88ff", "#ff88cc"]
+        for i in range(20):
+            seed  = i * 137
+            strip_x = cx - 280 + (seed * 19 + f * 4) % 560
+            strip_y = (seed * 13 + f * 3 + i * 31) % int(cy * 1.9 + 120)
+            col   = confetti_cols[i % len(confetti_cols)]
+            cr    = 3 + (seed % 3)
+            if (f + seed) % 2 == 0:
+                self.create_oval(strip_x - cr, strip_y - cr,
+                                 strip_x + cr, strip_y + cr,
+                                 fill=col, outline="")
+            else:
+                self.create_rectangle(strip_x - cr, strip_y - cr // 2,
+                                      strip_x + cr, strip_y + cr // 2,
+                                      fill=col, outline="")
+
+        # ── Robot 1 (left) — both arms raised, cheering ───────────────────
+        wave_l = -30 + 9 * math.sin(f * 0.20)
+        wave_r = -30 + 9 * math.sin(f * 0.20 + 0.4)
+        self._robot(cx - 140, cy + bob, {
+            "tilt": 8, "arm_l": wave_l, "arm_r": wave_r,
+            "eye_l": "^", "eye_r": "^", "mouth": "D",
+            "leg_l": 6, "leg_r": -6,
+            "glow": "#FFD93D",
+        })
+
+        # ── Robot 2 (right) — waving, holding lunchbox ───────────────────
+        wave_l2 = -30 + 9 * math.sin(f * 0.17 + 1.2)
+        self._robot(cx + 140, cy - bob, {
+            "tilt": -10, "arm_l": wave_l2, "arm_r": -12,
+            "eye_l": "^", "eye_r": "^", "mouth": ")",
+            "leg_l": -5, "leg_r": 5,
+            "glow": "#4ECDC4",
+        })
+        # Lunchbox held by robot 2's right hand
+        lx = cx + 100
+        ly = cy - bob + 12
+        self.create_rectangle(lx - 12, ly - 9, lx + 12, ly + 9,
+                               fill="#2a1a4e", outline="#4ECDC4", width=1)
+        self.create_text(lx, ly, text="🍱", font=("", 11), anchor="center")
 
     # ── Robot primitive ────────────────────────
 

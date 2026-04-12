@@ -348,6 +348,7 @@ class ToddlerTV:
         state.videos.append({
             "yt_url": yt_url,
             "stream_url": info["url"],
+            "audio_url":  info.get("audio_url"),
             "duration": info["duration"],
             "title": info.get("title", ""),
             "channel": info.get("channel", ""),
@@ -521,6 +522,7 @@ class ToddlerTV:
                     return
                 if info and isinstance(info, dict):
                     video["stream_url"] = info["url"]
+                    video["audio_url"]  = info.get("audio_url")
                     video["_resolved_at"] = time.time()
                     video["_play_retries"] = 0  # Reset on successful refresh
                 elif info == "RATE_LIMITED":
@@ -528,14 +530,14 @@ class ToddlerTV:
                 else:
                     print(f"[channel {index}] Re-resolve failed, using existing URL")
                 self.root.after(0, lambda: self._vlc_play(
-                    video["stream_url"], index, seek_ms
+                    video["stream_url"], index, seek_ms, video.get("audio_url")
                 ))
 
             threading.Thread(target=_refresh, daemon=True).start()
         else:
-            self._vlc_play(stream_url, index, seek_ms)
+            self._vlc_play(stream_url, index, seek_ms, video.get("audio_url"))
 
-    def _vlc_play(self, url: str, channel_index: int, seek_ms: int):
+    def _vlc_play(self, url: str, channel_index: int, seek_ms: int, audio_url: str | None = None):
         """Hand URL to VLC and wait for it to start playing."""
         if self.current_channel != channel_index or self.state != AppState.LOADING:
             return
@@ -544,6 +546,8 @@ class ToddlerTV:
 
         self.player.stop()
         media = self.vlc_instance.media_new(url)
+        if audio_url:
+            media.add_option(f":input-slave={audio_url}")
         self.player.set_media(media)
         self.player.audio_set_mute(True)
         self.player.play()
