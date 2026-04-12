@@ -107,7 +107,15 @@ class ToddlerTV:
         self.root.attributes("-fullscreen", True)
 
         # VLC
-        self.vlc_instance = vlc.Instance("--quiet")
+        # --network-caching=10000: 10-second buffer for network streams prevents
+        # the end-of-stream stall where YouTube DASH chunks run out and VLC
+        # freezes on the last frame while its audio buffer drains.
+        # --file-caching=2000: 2-second buffer for local files.
+        self.vlc_instance = vlc.Instance(
+            "--quiet",
+            "--network-caching=10000",
+            "--file-caching=2000",
+        )
         self.player = self.vlc_instance.media_player_new()
 
         # State
@@ -548,6 +556,9 @@ class ToddlerTV:
         media = self.vlc_instance.media_new(url)
         if audio_url:
             media.add_option(f":input-slave={audio_url}")
+            # Each slave stream needs its own caching hint when using split
+            # video+audio URLs, otherwise the audio can starve independently.
+            media.add_option(":network-caching=10000")
         self.player.set_media(media)
         self.player.audio_set_mute(True)
         self.player.play()

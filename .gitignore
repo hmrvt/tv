@@ -27,10 +27,14 @@ ffmpeg/lib/
 ffmpeg/presets/
 ffmpeg/share/
 ffmpeg/LICENSE
+ffmpeg/LICENSE.txt
+ffmpeg/LISCENSE.txt.backup
 
 # Dev notes
 Virtual Environments.txt
+Virtual Environments.txt.backup
 downloader.py
+FIX_PLAYBACK_ISSUE.md
 
 # OS
 .DS_Store

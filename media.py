@@ -4,6 +4,7 @@ ffmpeg detection, yt-dlp wrappers, and ChannelState.
 """
 
 import os
+import re
 import sys
 import json
 import random
@@ -106,6 +107,22 @@ else:
 #  URL HELPERS
 # ─────────────────────────────────────────────
 
+# YouTube video IDs are exactly 11 characters from this alphabet.
+# We allow up to 20 to be tolerant of non-YouTube sources while still
+# blocking any path-traversal sequence (which requires '/' or '.').
+_SAFE_VIDEO_ID = re.compile(r'^[A-Za-z0-9_-]{1,20}$')
+
+# Resolved once at import time so find_local_file can use it as a boundary.
+_VIDEOS_DIR_REAL = os.path.realpath(VIDEOS_DIR)
+
+
+def _validate_video_id(raw: str) -> str:
+    """Return the video ID unchanged if it is safe, otherwise raise ValueError."""
+    if not _SAFE_VIDEO_ID.match(raw):
+        raise ValueError(f"Unsafe video_id rejected: {raw!r}")
+    return raw
+
+
 def clean_url(youtube_url: str) -> str:
     if "watch?v=" in youtube_url:
         video_id = youtube_url.split("watch?v=")[1].split("&")[0]
@@ -114,16 +131,25 @@ def clean_url(youtube_url: str) -> str:
 
 
 def get_video_id(youtube_url: str) -> str:
+    """Extract and validate a video ID from a YouTube URL (CWE-22 Layer 1)."""
     if "watch?v=" in youtube_url:
-        return youtube_url.split("watch?v=")[1].split("&")[0]
-    return youtube_url.split("/")[-1]
+        raw = youtube_url.split("watch?v=")[1].split("&")[0]
+    else:
+        raw = youtube_url.split("/")[-1]
+    return _validate_video_id(raw)
 
 
 def find_local_file(video_id: str) -> str | None:
+    """Return a local file path only when it resolves inside VIDEOS_DIR (CWE-22 Layer 2)."""
+    _validate_video_id(video_id)  # re-validate at the sink (defence in depth)
     for ext in ("mp4", "mkv", "webm"):
-        path = os.path.join(VIDEOS_DIR, f"{video_id}.{ext}")
-        if os.path.exists(path):
-            return path
+        candidate = os.path.join(VIDEOS_DIR, f"{video_id}.{ext}")
+        # Resolve symlinks and '..' before the boundary check.
+        real = os.path.realpath(candidate)
+        if not real.startswith(_VIDEOS_DIR_REAL + os.sep):
+            raise ValueError(f"Path escape detected: {candidate!r} → {real!r}")
+        if os.path.exists(real):
+            return real
     return None
 
 
@@ -212,8 +238,6 @@ def get_video_info(youtube_url: str) -> dict | None:
             result = subprocess.run(
                 [sys.executable, "-m", "yt_dlp",
                  *_cookie_args(),
-                 "--js-runtimes", "node",
-                 "--remote-components", "ejs:github",
                  *_ffmpeg_args(),
                  "--skip-download",
                  "--print", "%(title)s|||%(channel)s|||%(thumbnail)s|||%(channel_id)s",
@@ -247,8 +271,6 @@ def get_video_info(youtube_url: str) -> dict | None:
             [
                 sys.executable, "-m", "yt_dlp",
                 *_cookie_args(),
-                "--js-runtimes", "node",
-                "--remote-components", "ejs:github",
                 *_ffmpeg_args(),
                 # Prefer 1080p video-only + separate audio so VLC can play via
                 # input-slave. Falls back to best pre-muxed if unavailable.

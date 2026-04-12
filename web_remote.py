@@ -4,7 +4,12 @@ A tiny HTTP server for controlling the off-period schedule from your phone.
 Runs on port 8080 by default. Open http://<media-pc-ip>:8080 from any device on the same WiFi.
 """
 
+import base64
+import html as _html
 import json
+import logging
+import re
+import secrets
 import socket
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -12,6 +17,21 @@ from urllib.parse import parse_qs
 
 from schedule import get_periods, save_periods
 from config import SCENES
+
+# ─────────────────────────────────────────────
+#  SECURITY CONSTANTS
+# ─────────────────────────────────────────────
+
+MAX_BODY    = 16_384   # 16 KB hard cap on POST body (CWE-400)
+MAX_PERIODS = 48       # hard cap on period count per request (CWE-400)
+
+# Both tokens are generated fresh on each process start.
+_CSRF_TOKEN    = secrets.token_hex(16)
+_BOOT_PASSWORD = secrets.token_urlsafe(12)
+_BASIC_REALM   = "Toddler TV Remote"
+_CREDENTIALS   = base64.b64encode(f"admin:{_BOOT_PASSWORD}".encode()).decode()
+
+_log = logging.getLogger("web_remote")
 
 PORT = 8080
 
@@ -62,7 +82,7 @@ def _build_page(periods: list, message: str = "") -> str:
         </div>
         """
 
-    message_html = f'<div class="message">{message}</div>' if message else ""
+    message_html = f'<div class="message">{_html.escape(message)}</div>' if message else ""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -358,6 +378,7 @@ select:focus {{
 
     <form method="POST" action="/">
         <input type="hidden" name="count" value="{len(periods)}">
+        <input type="hidden" name="csrf"  value="{_CSRF_TOKEN}">
 
         <div class="section-label">Off Periods</div>
 
@@ -390,38 +411,102 @@ select:focus {{
 
 class _Handler(BaseHTTPRequestHandler):
 
+    # ── Auth helpers (CWE-306) ─────────────────────────────────────────────────
+
+    def _check_auth(self) -> bool:
+        """Return True only when the request carries valid Basic Auth."""
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Basic "):
+            return False
+        # secrets.compare_digest prevents timing-based credential leaks.
+        return secrets.compare_digest(auth[6:], _CREDENTIALS)
+
+    def _send_auth_challenge(self) -> None:
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", f'Basic realm="{_BASIC_REALM}"')
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self._send_security_headers()
+        self.end_headers()
+        self.wfile.write(b"Unauthorized")
+
+    # ── Routing ───────────────────────────────────────────────────────────────
+
     def do_GET(self):
+        if not self._check_auth():
+            self._send_auth_challenge()
+            return
         periods = get_periods()
         html = _build_page(periods)
         self._respond(200, html)
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length).decode("utf-8")
+        if not self._check_auth():
+            self._send_auth_challenge()
+            return
+
+        # ── 1. Hard-cap body size before reading (CWE-400) ───────────────────
+        try:
+            raw_len = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            raw_len = 0
+        length = min(raw_len, MAX_BODY)
+        body = self.rfile.read(length).decode("utf-8", errors="replace")
         params = parse_qs(body)
 
         def first(key, default=""):
-            vals = params.get(key, [default])
-            return vals[0]
+            return params.get(key, [default])[0]
+
+        # ── 2. CSRF token validation (CWE-352) ────────────────────────────────
+        if not secrets.compare_digest(first("csrf"), _CSRF_TOKEN):
+            # Strip anything that isn't a valid IP character before logging
+            # to prevent log-injection via a crafted peer address (L1).
+            safe_peer = re.sub(r"[^\w.:\[\]-]", "?", self.client_address[0])
+            _log.warning("CSRF token mismatch from %s", safe_peer)
+            self._respond(403, "<h1>403 Forbidden</h1>")
+            return
 
         action = first("action")
-        count = int(first("count", "0"))
 
-        # Parse existing periods from form
+        # ── 3. Hard-cap period count (CWE-400) ────────────────────────────────
+        try:
+            count = min(int(first("count", "0")), MAX_PERIODS)
+        except ValueError:
+            count = 0
+
+        # ── 4. Parse periods with full validation ─────────────────────────────
+        _valid_scenes = set(SCENES.keys())
         periods = []
         for i in range(count):
             start = first(f"start_{i}", "00:00")
-            end = first(f"end_{i}", "00:00")
+            end   = first(f"end_{i}",   "00:00")
             scene = first(f"scene_{i}", "sleeping")
 
-            sh, sm = (int(x) for x in start.split(":"))
-            eh, em = (int(x) for x in end.split(":"))
+            # Validate and clamp time fields (CWE-755)
+            try:
+                parts_s = start.split(":")
+                parts_e = end.split(":")
+                sh, sm = int(parts_s[0]), int(parts_s[1])
+                eh, em = int(parts_e[0]), int(parts_e[1])
+                sh, sm = max(0, min(23, sh)), max(0, min(59, sm))
+                eh, em = max(0, min(23, eh)), max(0, min(59, em))
+            except (ValueError, IndexError):
+                _log.warning("Malformed time in period %d — skipped", i)
+                continue
+
+            # Whitelist scene against known keys (CWE-20)
+            if scene not in _valid_scenes:
+                _log.warning("Unknown scene %r in period %d — defaulting", scene, i)
+                scene = "sleeping"
+
             periods.append((sh, sm, eh, em, scene))
 
-        # Handle delete
+        # ── 5. Action dispatch ────────────────────────────────────────────────
         delete_idx = first("delete", "")
         if delete_idx != "":
-            idx = int(delete_idx)
+            try:
+                idx = int(delete_idx)
+            except ValueError:
+                idx = -1
             if 0 <= idx < len(periods):
                 periods.pop(idx)
             save_periods(periods)
@@ -444,15 +529,35 @@ class _Handler(BaseHTTPRequestHandler):
             html = _build_page(periods)
             self._respond(200, html)
 
+    def _send_security_headers(self) -> None:
+        """Emit hardening headers on every response (L2)."""
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        # CSP matched to what the page actually loads:
+        #   - inline <style> block            → style-src 'unsafe-inline'
+        #   - Google Fonts CSS @import        → style-src fonts.googleapis.com
+        #   - Google Fonts font files         → font-src fonts.gstatic.com
+        #   - no scripts anywhere             → script-src 'none'
+        #   - frame-ancestors 'none' mirrors X-Frame-Options for modern browsers
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; "
+            "style-src 'unsafe-inline' https://fonts.googleapis.com; "
+            "font-src https://fonts.gstatic.com; "
+            "script-src 'none'; "
+            "frame-ancestors 'none'",
+        )
+
     def _respond(self, code: int, html: str):
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self._send_security_headers()
         self.end_headers()
         self.wfile.write(html.encode("utf-8"))
 
     def log_message(self, fmt, *args):
-        # Suppress default access logs
-        pass
+        # Route access logs through the standard logging system (CWE-778)
+        _log.info(fmt, *args)
 
 
 # ─────────────────────────────────────────────
@@ -461,11 +566,14 @@ class _Handler(BaseHTTPRequestHandler):
 
 def start_web_remote(port: int = PORT) -> None:
     """Start the web remote server in a daemon thread."""
+    logging.basicConfig(level=logging.INFO, format="[%(name)s] %(levelname)s %(message)s")
     ip = _get_local_ip()
 
     def _run():
         server = HTTPServer(("0.0.0.0", port), _Handler)
-        print(f"[remote] Web remote running at http://{ip}:{port}")
+        print(f"[remote] Web remote → http://{ip}:{port}")
+        print(f"[remote] Login  →  username: admin   password: {_BOOT_PASSWORD}")
+        print(f"[remote] (password is regenerated on every restart)")
         server.serve_forever()
 
     thread = threading.Thread(target=_run, daemon=True)
