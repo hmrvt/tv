@@ -165,6 +165,15 @@ def _cookie_args() -> list[str]:
     return ["--cookies", "cookies.txt"] if os.path.exists("cookies.txt") else []
 
 
+def _js_runtime_args() -> list[str]:
+    """Pass a JS runtime to yt-dlp so YouTube extraction works (required since ~2026)."""
+    import shutil
+    for runtime in ("node", "deno", "bun"):
+        if shutil.which(runtime):
+            return ["--js-runtimes", runtime]
+    return []
+
+
 def _subprocess_env() -> dict:
     """Return an environment dict with FFMPEG_LOCATION added to PATH."""
     env = os.environ.copy()
@@ -184,6 +193,7 @@ def get_playlist_urls(playlist_url: str) -> list[str]:
                 "--print", "url",
                 "--no-warnings",
                 *_ffmpeg_args(),
+                *_js_runtime_args(),
                 playlist_url,
             ],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -239,6 +249,7 @@ def get_video_info(youtube_url: str) -> dict | None:
                 [sys.executable, "-m", "yt_dlp",
                  *_cookie_args(),
                  *_ffmpeg_args(),
+                 *_js_runtime_args(),
                  "--skip-download",
                  "--print", "%(title)s|||%(channel)s|||%(thumbnail)s|||%(channel_id)s",
                  "--no-warnings",
@@ -272,9 +283,10 @@ def get_video_info(youtube_url: str) -> dict | None:
                 sys.executable, "-m", "yt_dlp",
                 *_cookie_args(),
                 *_ffmpeg_args(),
+                *_js_runtime_args(),
                 # Prefer 1080p video-only + separate audio so VLC can play via
                 # input-slave. Falls back to best pre-muxed if unavailable.
-                "--format", "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best",
+                "--format", "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/bestvideo+bestaudio/best",
                 "--dump-single-json",
                 "--no-warnings",
                 youtube_url,
@@ -295,6 +307,8 @@ def get_video_info(youtube_url: str) -> dict | None:
             return "RATE_LIMITED"
 
         info = json.loads(result.stdout.strip())
+        if not isinstance(info, dict):
+            return None
         requested = info.get("requested_formats", [])
         if len(requested) >= 2:
             video_url = requested[0].get("url", "")
