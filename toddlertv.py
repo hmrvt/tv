@@ -1,6 +1,6 @@
 """
 Toddler TV - A simulated live TV experience for kids
-Requires: pip install yt-dlp python-vlc pillow
+Requires: pip install yt-dlp python-vlc pillow "qrcode[pil]"
 Also requires VLC media player: https://www.videolan.org/
 
 Project layout:
@@ -38,7 +38,7 @@ from schedule import is_tv_off, current_scene_name
 from media import ChannelState, get_video_info, get_playlist_urls
 from images import fetch_channel_avatar, get_cached_avatar, set_cached_avatar, is_avatar_fetched
 from robot_canvas import RobotCanvas, RobotWorldCanvas
-from web_remote import start_web_remote
+from web_remote import start_web_remote, get_remote_url
 
 import random
 
@@ -773,6 +773,7 @@ class ToddlerTV:
         ]
 
         self._draw_scanlines()
+        self._build_qr_overlay()
 
     def _make_channel_button(self, index: int, channel: dict) -> tk.Canvas:
         color = channel.get("color", "#555555")
@@ -800,6 +801,56 @@ class ToddlerTV:
         h = self.video_frame.winfo_height() or int(self.root.winfo_screenheight() * 0.76)
         for y in range(0, h, 4):
             self.static_canvas.create_line(0, y, w, y, fill="#000033", width=1)
+
+    def _build_qr_overlay(self):
+        try:
+            import qrcode
+            from PIL import ImageTk as _ImageTk, Image as _Image
+        except ImportError:
+            return
+
+        screen_h = self.root.winfo_screenheight()
+        qr_size = max(90, min(150, int(screen_h * 0.76) // 6))
+        label_h = 16
+        pad = 6
+        canvas_w = qr_size + pad * 2
+        canvas_h = qr_size + pad * 2 + label_h + 4
+
+        # Canvas is a sibling of video_frame on main_frame, so it renders above VLC
+        self.qr_overlay = tk.Canvas(
+            self.main_frame,
+            bg="#0d0721",
+            highlightthickness=3,
+            highlightbackground="#00ff88",
+            width=canvas_w,
+            height=canvas_h,
+        )
+        self.qr_overlay.place(relx=1.0, rely=0.76, anchor="se", x=-14, y=-14)
+
+        qr = qrcode.QRCode(
+            error_correction=qrcode.constants.ERROR_CORRECT_M,
+            box_size=4,
+            border=2,
+        )
+        qr.add_data(get_remote_url())
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="white", back_color="#0d0721")
+        img = img.resize((qr_size, qr_size), _Image.LANCZOS)
+        self._qr_photo = _ImageTk.PhotoImage(img)
+
+        cx = canvas_w // 2
+        self.qr_overlay.create_image(cx, pad + qr_size // 2, image=self._qr_photo, anchor="center")
+
+        sep_y = pad + qr_size + 2
+        self.qr_overlay.create_line(0, sep_y, canvas_w, sep_y, fill="#00ff88", width=1)
+
+        self.qr_overlay.create_text(
+            cx, sep_y + 2 + label_h // 2,
+            text="REMOTE",
+            font=("Courier New", 9, "bold"),
+            fill="#00ff88",
+            anchor="center",
+        )
 
     # ─────────────────────────────────────────
     #  UI UPDATES

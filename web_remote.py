@@ -564,6 +564,12 @@ class _Handler(BaseHTTPRequestHandler):
 #  PUBLIC API
 # ─────────────────────────────────────────────
 
+def get_remote_url() -> str:
+    """Return the full URL with embedded Basic Auth credentials for QR code generation."""
+    ip = _get_local_ip()
+    return f"http://admin:{_BOOT_PASSWORD}@{ip}:{PORT}"
+
+
 def start_web_remote(port: int = PORT) -> None:
     """Start the web remote server in a daemon thread."""
     logging.basicConfig(level=logging.INFO, format="[%(name)s] %(levelname)s %(message)s")
