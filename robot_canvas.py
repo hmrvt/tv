@@ -288,6 +288,12 @@ class MiniRobotCanvas(tk.Canvas):
         self._scene_frames  = 0
         self._scene_length  = random.randint(440, 560)
         self._stars         = []
+        # Per-robot character variation
+        self.accent_color    = random.choice(ACCENT_COLORS)
+        self.face            = random.choice(list(FACE_VARIANTS.keys()))
+        self.accessory_name  = random.choices(
+            list(ACCESSORIES.keys()), weights=[5, 1, 1, 1, 1])[0]
+        self.accessory_color = random.choice(ACCENT_COLORS)
 
     def start(self):
         self._animating = True
@@ -358,21 +364,36 @@ class MiniRobotCanvas(tk.Canvas):
         else:
             self._mini_working(cx, cy, s, f)
 
-    def _robot(self, cx, cy, s, opts=None):
-        if opts is None:
-            opts = {}
-        tilt  = opts.get("tilt", 0)
-        arm_l = opts.get("arm_l", 0)
-        arm_r = opts.get("arm_r", 0)
-        leg_l = opts.get("leg_l", 0)
-        leg_r = opts.get("leg_r", 0)
-        eye_l = opts.get("eye_l", "●")
-        eye_r = opts.get("eye_r", "●")
-        mouth = opts.get("mouth", "—")
-        bc    = opts.get("color", _DARK_BODY)
-        glow  = opts.get("glow", _GLOW)
-        _draw_robot_full(self, cx, cy, s, tilt, arm_l, arm_r, leg_l, leg_r,
-                         eye_l, eye_r, mouth, bc, glow)
+    def _draw_mini_robot(self, cx, cy_body, s, activity):
+        """Draw the pixel-art robot for a mini scene.
+
+        cy_body is the body-centre coordinate (same convention as the old
+        _draw_robot_full); visual ground = cy_body + 78*s.
+        Returns (sprite_top_y, sprite_bottom_y) for prop placement.
+        """
+        pixel_size    = 2
+        sprite_bottom = int(cy_body + 78 * s)
+        cy_sprite     = sprite_bottom - 12 * pixel_size
+
+        pal = dict(DEFAULT_PALETTE)
+        pal["G"] = self.accent_color
+
+        frames     = ROBOT_SPRITES.get(activity, ROBOT_SPRITES["idle"])
+        frame_rate = ACTIVITY_FRAME_RATE.get(activity, 0.18)
+        anim_phase = self.frame * frame_rate * _PHASE
+        frame_idx  = int(anim_phase * len(frames) / (2 * math.pi)) % len(frames)
+
+        face_variant = None if activity == "sleep" else FACE_VARIANTS.get(self.face)
+        accessory    = ACCESSORIES.get(self.accessory_name)
+
+        draw_pixel_sprite(self, frames[frame_idx], cx, cy_sprite, pixel_size,
+                          palette=pal,
+                          face=face_variant,
+                          accessory=accessory,
+                          accessory_color=self.accessory_color)
+
+        sprite_top = cy_sprite - 12 * pixel_size
+        return sprite_top, sprite_bottom
 
     def _mini_sleeping(self, cx, cy, s, f):
         bob = math.sin(f * 0.05 * _PHASE) * 3
@@ -390,22 +411,18 @@ class MiniRobotCanvas(tk.Canvas):
             sr = 1.0 + math.sin(f*0.07*_PHASE+i)*0.4
             self.create_oval(sx-sr, sy-sr, sx+sr, sy+sr, fill="#FFD93D", outline="")
 
-        self._robot(cx, cy + bob, s, {
-            "tilt": 18, "arm_l": 14, "arm_r": 6,
-            "eye_l": "—", "eye_r": "—", "mouth": "~",
-            "leg_l": 6, "leg_r": -5,
-        })
-        # Zzz bubbles
+        sprite_top, sprite_bottom = self._draw_mini_robot(cx, cy + bob, s, "sleep")
+        # Zzz bubbles: float above the antenna tips
         zzz_phase = (f // 60) % 3
         for i in range(zzz_phase + 1):
             self.create_text(
-                cx + int(28*s) + i*int(10*s),
-                cy - int(38*s) - i*int(10*s) + math.sin(f*0.04*_PHASE)*2,
+                cx + int(14*s) + i*int(8*s),
+                sprite_top - int(3*s) - i*int(7*s) + math.sin(f*0.04*_PHASE)*2,
                 text="z", fill=_TEAL,
                 font=("Courier New", max(6, int((7+i*3)*s)), "bold"),
             )
-        # Emoji pillow
-        self.create_text(cx - int(38*s), cy + int(28*s), text=self.emoji,
+        # Emoji pillow: near the robot's feet
+        self.create_text(cx - int(25*s), sprite_bottom - int(4*s), text=self.emoji,
                         font=("", max(8, int(18*s))), anchor="center")
 
     def _mini_lunch(self, cx, cy, s, f):
@@ -428,12 +445,7 @@ class MiniRobotCanvas(tk.Canvas):
             self.create_line(cx+int(sx*s), cy+int(30*s)+steam_y,
                            cx+int(sx*s)+1, cy+int(22*s)+steam_y,
                            fill="#445566", width=1)
-        eat = _eased_sin(f*0.18*_PHASE)*int(8*s)
-        self._robot(cx, cy+bob, s, {
-            "tilt": 6, "arm_r": -int(14 - eat/s if s > 0 else 14),
-            "eye_l": "^", "eye_r": "^", "mouth": "U",
-            "leg_l": 4, "leg_r": -4,
-        })
+        self._draw_mini_robot(cx, cy + bob, s, "eat")
 
     def _mini_working(self, cx, cy, s, f):
         bob = math.sin(f*0.1*_PHASE)*2
@@ -462,11 +474,7 @@ class MiniRobotCanvas(tk.Canvas):
             self.create_text(tv_x-int(2*s)+i*int(4*s), tv_y-int(6*s)+i*int(2*s),
                            text="✦", fill=spark_colors[i],
                            font=("Courier New", max(5, int((4+i)*s))))
-        self._robot(robot_cx, cy+bob, s, {
-            "tilt": 14, "arm_r": -20,
-            "eye_l": "●", "eye_r": "●", "mouth": "/",
-            "leg_l": 5, "leg_r": -3,
-        })
+        self._draw_mini_robot(robot_cx, cy + bob, s, "fix")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
