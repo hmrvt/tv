@@ -61,27 +61,96 @@ assert all(len(r) == 20 for r in ROBOT_IDLE), (
 )
 
 
+# ── Per-robot variation ───────────────────────────────────────────────────────
+
+ACCENT_COLORS = [
+    "#4ECDC4",  # teal (default)
+    "#FF6B9D",  # pink
+    "#FFD93D",  # yellow
+    "#A18CD1",  # lavender
+    "#6BCB77",  # mint
+    "#FF8C42",  # orange
+    "#7BD3F7",  # sky blue
+]
+
+# 12-wide × 6-tall face overlays for rows 7-12, cols 4-15 of the sprite.
+# F = face-screen dark, G = accent color.  All strings must be exactly 12 chars.
+FACE_VARIANTS = {
+    "default":   ["FFFFFFFFFFFF",
+                  "FFGFFFFFFGFF",
+                  "FFGFFFFFFGFF",
+                  "FFFFGFFGFFFF",
+                  "FFFFFGGFFFFF",
+                  "FFFFFFFFFFFF"],
+    "happy":     ["FFFFFFFFFFFF",
+                  "FGGFFFFFGGGF",
+                  "FGGFFFFFGGGF",
+                  "FFFGGGGGFFFF",
+                  "FFGGGGGGGFFF",
+                  "FFFFFFFFFFFF"],
+    "sleepy":    ["FFFFFFFFFFFF",
+                  "FFFFFFFFFFFF",
+                  "FFGFFFFFFGFF",
+                  "FFFGGGGGFFFF",
+                  "FFFFFFFFFFFF",
+                  "FFFFFFFFFFFF"],
+    "surprised": ["FFFFFFFFFFFF",
+                  "FGGGFFFFFGGG",
+                  "FGGGFFFFFGGG",
+                  "FFFFFGGFFFFF",
+                  "FFFFFGGFFFFF",
+                  "FFFFFFFFFFFF"],
+    "wink":      ["FFFFFFFFFFFF",
+                  "GGGFFFFFFGFF",
+                  "FGFFFFFFFGFF",
+                  "FFFFGFFGFFFF",
+                  "FFFFFGGFFFFF",
+                  "FFFFFFFFFFFF"],
+}
+
+# Accessory overlays.  row/col are sprite-grid coordinates.
+# Grid strings use: H = accessory_color, K = outline, J = joint, . = transparent.
+ACCESSORIES = {
+    "none":        None,
+    "hat":         {"row": 3, "col": 6,
+                    "grid": [".HHHHH.", "HHHHHHH"]},
+    "scarf":       {"row": 15, "col": 5,
+                    "grid": ["HHHHHHHHHH", "HHHHHHHHHH"]},
+    "bowtie":      {"row": 15, "col": 7,
+                    "grid": ["HKHHKH", "KHHHHK", "HKHHKH"]},
+    "headphones":  {"row": 5, "col": 0,
+                    "grid": ["JJ................JJ", "JJ................JJ"]},
+}
+
+
 # ── Renderer ──────────────────────────────────────────────────────────────────
 
 def draw_pixel_sprite(canvas, sprite, cx, cy, pixel_size,
-                      palette=None, tags="dynamic", flip=False):
+                      palette=None, tags="dynamic", flip=False,
+                      face=None, accessory=None, accessory_color=None):
     """Draw a sprite (list of equal-length strings) centered at (cx, cy).
 
     Parameters
     ----------
-    canvas      : tk.Canvas
-    sprite      : list[str]  — each string is one row of palette codes
-    cx, cy      : int        — pixel centre of the sprite on the canvas
-    pixel_size  : int        — side length (px) of one sprite pixel
-    palette     : dict | None — code→hex-color; falls back to DEFAULT_PALETTE
-    tags        : str        — Tkinter item tag; use 'dynamic' for world canvas
-    flip        : bool       — mirror horizontally (for left-facing agents)
+    canvas          : tk.Canvas
+    sprite          : list[str]  — each string is one row of palette codes
+    cx, cy          : int        — pixel centre of the sprite on the canvas
+    pixel_size      : int        — side length (px) of one sprite pixel
+    palette         : dict | None — code→hex-color; falls back to DEFAULT_PALETTE
+    tags            : str        — Tkinter item tag; use 'dynamic' for world canvas
+    flip            : bool       — mirror horizontally (for left-facing agents)
+    face            : list[str] | None — 6-row × 12-col face overlay (rows 7-12,
+                                         cols 4-15); uses palette codes F and G
+    accessory       : dict | None — {"row", "col", "grid"} overlay descriptor
+    accessory_color : str | None  — hex color for 'H' codes in accessory grid
     """
     pal  = palette if palette is not None else DEFAULT_PALETTE
     rows = len(sprite)
     cols = len(sprite[0]) if rows else 0
     x0   = cx - (cols * pixel_size) // 2
     y0   = cy - (rows * pixel_size) // 2
+
+    # Main sprite
     for ry, row in enumerate(sprite):
         py = y0 + ry * pixel_size
         for rx, ch in enumerate(row):
@@ -96,6 +165,55 @@ def draw_pixel_sprite(canvas, sprite, cx, cy, pixel_size,
                 px, py, px + pixel_size, py + pixel_size,
                 fill=color, outline="", tags=tags,
             )
+
+    # Face variant overlay (rows 7-12, cols 4-15 in sprite space)
+    if face is not None:
+        for fry, frow in enumerate(face):
+            ry = 7 + fry
+            py = y0 + ry * pixel_size
+            for frx, ch in enumerate(frow):
+                if ch in (".", " "):
+                    continue
+                color = pal.get(ch)
+                if color is None:
+                    continue
+                rx = 4 + ((11 - frx) if flip else frx)
+                col_idx = (cols - 1 - rx) if flip else rx
+                px = x0 + col_idx * pixel_size
+                canvas.create_rectangle(
+                    px, py, px + pixel_size, py + pixel_size,
+                    fill=color, outline="", tags=tags,
+                )
+
+    # Accessory overlay
+    if accessory is not None:
+        acc_grid  = accessory.get("grid", [])
+        acc_row   = accessory.get("row", 0)
+        acc_col   = accessory.get("col", 0)
+        acc_width = len(acc_grid[0]) if acc_grid else 0
+        for ary, arow in enumerate(acc_grid):
+            ry = acc_row + ary
+            if not (0 <= ry < rows):
+                continue
+            py = y0 + ry * pixel_size
+            for arx, ch in enumerate(arow):
+                if ch in (".", " "):
+                    continue
+                if ch == "H":
+                    color = accessory_color
+                else:
+                    color = pal.get(ch)
+                if color is None:
+                    continue
+                rx = acc_col + ((acc_width - 1 - arx) if flip else arx)
+                if not (0 <= rx < cols):
+                    continue
+                col_idx = (cols - 1 - rx) if flip else rx
+                px = x0 + col_idx * pixel_size
+                canvas.create_rectangle(
+                    px, py, px + pixel_size, py + pixel_size,
+                    fill=color, outline="", tags=tags,
+                )
 
 
 # ── Activity sprite helpers ───────────────────────────────────────────────────
@@ -130,7 +248,7 @@ _LEG_IDLE_23  = ".....KJJK..KJJK....."
 # Closed-eye / flat-mouth face rows for sleep
 _EYE_CLOSED   = ".KWKFFKFFFFFFKFFKWK."  # G→K (eyes shut)
 _MOUTH_FLAT1  = ".KWKFFFFKFFKFFFFKWK."  # G→K (neutral line, row 10)
-_MOUTH_FLAT2  = ".KWKFFFFFKKFFFFFkwk."  # G→K (neutral line, row 11)
+_MOUTH_FLAT2  = ".KWKFFFFFKKFFFFFkwk."[:-4] + "KWK."  # fixed uppercase
 
 # ── Walk — 4 frames ───────────────────────────────────────────────────────────
 # Arms swing opposite to legs; legs alternate long/short to show stride.

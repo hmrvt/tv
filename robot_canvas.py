@@ -15,7 +15,8 @@ import tkinter as tk
 from config import SCENES
 from schedule import next_on_time
 from pixel_sprites import (draw_pixel_sprite, DEFAULT_PALETTE,
-                           ROBOT_SPRITES, ACTIVITY_FRAME_RATE)
+                           ROBOT_SPRITES, ACTIVITY_FRAME_RATE,
+                           ACCENT_COLORS, FACE_VARIANTS, ACCESSORIES)
 
 _MINI_SCENES = ["sleeping", "lunch", "working"]
 
@@ -474,19 +475,25 @@ class MiniRobotCanvas(tk.Canvas):
 
 class _RobotAgent:
     def __init__(self, x: float, ground_y: float, emoji: str, color: str, scale: float):
-        self.x         = x
-        self.ground_y  = ground_y
-        self.emoji     = emoji
-        self.color     = color
-        self.scale     = scale
-        self.direction = random.choice([-1, 1])
+        self.x              = x
+        self.ground_y       = ground_y
+        self.emoji          = emoji
+        self.color          = color   # emoji halo / channel identity color
+        self.scale          = scale
+        self.direction      = random.choice([-1, 1])
         # Fixed pixel/sec speed — independent of scale so agents always move visibly
-        self.speed     = random.uniform(30, 80)
-        self.activity  = random.choice(_ACT_KEYS)
-        self.act_pool  = _ACT_KEYS   # overridden by world canvas after creation
-        self._act_timer= random.randint(0, 180)
-        self._act_dur  = random.randint(80, 220)
-        self.phase     = random.uniform(0, math.pi * 2)
+        self.speed          = random.uniform(30, 80)
+        self.activity       = random.choice(_ACT_KEYS)
+        self.act_pool       = _ACT_KEYS   # overridden by world canvas after creation
+        self._act_timer     = random.randint(0, 180)
+        self._act_dur       = random.randint(80, 220)
+        self.phase          = random.uniform(0, math.pi * 2)
+        # Per-robot character variation
+        self.accent_color   = random.choice(ACCENT_COLORS)
+        self.face           = random.choice(list(FACE_VARIANTS.keys()))
+        self.accessory_name = random.choices(
+            list(ACCESSORIES.keys()), weights=[5, 1, 1, 1, 1])[0]
+        self.accessory_color = random.choice(ACCENT_COLORS)
 
     def update(self, dt: float, world_w: float):
         self._act_timer += 1
@@ -1181,16 +1188,22 @@ class RobotWorldCanvas(tk.Canvas):
         pixel_size = 3 if agent.scale >= self._scale * 0.9 else 2
         cy_sprite  = int(agent.ground_y + 78 * agent.scale - 12 * pixel_size + bob)
         agent_palette = dict(DEFAULT_PALETTE)
-        agent_palette["G"] = agent.color
+        agent_palette["G"] = agent.accent_color
 
         frames     = ROBOT_SPRITES.get(act_name, ROBOT_SPRITES["idle"])
         frame_rate = ACTIVITY_FRAME_RATE.get(act_name, 0.18)
         anim_phase = f * frame_rate * _PHASE + agent.phase
         frame_idx  = int(anim_phase * len(frames) / (2 * math.pi)) % len(frames)
 
+        face_variant = None if act_name == "sleep" else FACE_VARIANTS.get(agent.face)
+        accessory    = ACCESSORIES.get(agent.accessory_name)
+
         draw_pixel_sprite(self, frames[frame_idx], int(cx), cy_sprite, pixel_size,
                           palette=agent_palette, tags="dynamic",
-                          flip=(d < 0))
+                          flip=(d < 0),
+                          face=face_variant,
+                          accessory=accessory,
+                          accessory_color=agent.accessory_color)
         # _draw_robot_full(self, cx, cy+bob, s, tilt, arm_l, arm_r, leg_l, leg_r,
         #                  eye_l, eye_r, mouth, body_col, agent.color, tag="dynamic")
 
