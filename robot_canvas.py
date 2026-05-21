@@ -14,12 +14,13 @@ import tkinter as tk
 
 from config import SCENES
 from schedule import next_on_time
+from pixel_sprites import draw_pixel_sprite, ROBOT_IDLE, DEFAULT_PALETTE
 
 _MINI_SCENES = ["sleeping", "lunch", "working"]
 
-# Frame-rate scale factor: at 60fps each frame is half the wall-clock time vs
-# the original 30fps reference, so all phase coefficients must be halved.
-_PHASE = 0.5
+# Frame-rate scale factor relative to the original 30fps reference.
+# 40fps target: each frame is 0.75× the wall-clock time of a 30fps frame.
+_PHASE = 0.83
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  PALETTE
@@ -105,86 +106,94 @@ def _rounded_rect_points(x1, y1, x2, y2, radius):
     ]
 
 
-def _draw_eye(canvas, cx, cy, r, style, color):
+def _draw_eye(canvas, cx, cy, r, style, color, tag=None):
     """Draw a robot eye at (cx, cy) with radius r."""
+    kw = {"tags": tag} if tag else {}
     r = max(1.5, r)
     if style == "●":
-        canvas.create_oval(cx-r, cy-r, cx+r, cy+r, fill=color, outline="")
-        # Specular highlight
+        canvas.create_oval(cx-r, cy-r, cx+r, cy+r, fill=color, outline="", **kw)
         hr = r * 0.35
         canvas.create_oval(cx-r*0.55, cy-r*0.6, cx-r*0.55+hr, cy-r*0.6+hr,
-                           fill="#ffffff", outline="")
+                           fill="#ffffff", outline="", **kw)
     elif style == "◉":
-        canvas.create_oval(cx-r, cy-r, cx+r, cy+r, fill=color, outline="")
-        canvas.create_oval(cx-r*0.5, cy-r*0.5, cx+r*0.5, cy+r*0.5, fill="#000820", outline="")
-        canvas.create_oval(cx-r*0.2, cy-r*0.2, cx+r*0.2, cy+r*0.2, fill=color, outline="")
+        canvas.create_oval(cx-r, cy-r, cx+r, cy+r, fill=color, outline="", **kw)
+        canvas.create_oval(cx-r*0.5, cy-r*0.5, cx+r*0.5, cy+r*0.5, fill="#000820", outline="", **kw)
+        canvas.create_oval(cx-r*0.2, cy-r*0.2, cx+r*0.2, cy+r*0.2, fill=color, outline="", **kw)
     elif style == "—":
         canvas.create_line(cx-r*0.85, cy, cx+r*0.85, cy,
-                          fill=color, width=max(1, int(r*0.5)))
+                          fill=color, width=max(1, int(r*0.5)), **kw)
     elif style in ("^", "*"):
         w = max(1, int(r * 0.45))
-        canvas.create_line(cx-r, cy+r*0.3, cx, cy-r*0.6, fill=color, width=w)
-        canvas.create_line(cx, cy-r*0.6, cx+r, cy+r*0.3, fill=color, width=w)
+        canvas.create_line(cx-r, cy+r*0.3, cx, cy-r*0.6, fill=color, width=w, **kw)
+        canvas.create_line(cx, cy-r*0.6, cx+r, cy+r*0.3, fill=color, width=w, **kw)
     elif style == "·":
-        canvas.create_oval(cx-r*0.4, cy-r*0.4, cx+r*0.4, cy+r*0.4, fill=color, outline="")
+        canvas.create_oval(cx-r*0.4, cy-r*0.4, cx+r*0.4, cy+r*0.4, fill=color, outline="", **kw)
     elif style == "X":
         w = max(1, int(r * 0.4))
-        canvas.create_line(cx-r*0.7, cy-r*0.7, cx+r*0.7, cy+r*0.7, fill=color, width=w)
-        canvas.create_line(cx+r*0.7, cy-r*0.7, cx-r*0.7, cy+r*0.7, fill=color, width=w)
+        canvas.create_line(cx-r*0.7, cy-r*0.7, cx+r*0.7, cy+r*0.7, fill=color, width=w, **kw)
+        canvas.create_line(cx+r*0.7, cy-r*0.7, cx-r*0.7, cy+r*0.7, fill=color, width=w, **kw)
     else:
         canvas.create_text(cx, cy, text=style, fill=color,
-                          font=("Courier New", max(5, int(r * 1.7))))
+                          font=("Courier New", max(5, int(r * 1.7))), **kw)
 
 
-def _draw_mouth(canvas, cx, cy, hw, style, color):
+def _draw_mouth(canvas, cx, cy, hw, style, color, tag=None):
     """Draw a robot mouth. hw = half-width of the mouth area."""
+    kw = {"tags": tag} if tag else {}
     sw = max(1, int(hw * 0.22))
     if style == "—":
-        canvas.create_line(cx-hw*0.7, cy, cx+hw*0.7, cy, fill=color, width=sw)
+        canvas.create_line(cx-hw*0.7, cy, cx+hw*0.7, cy, fill=color, width=sw, **kw)
     elif style in ("D", ")"):
         pts = [(-0.65, 0.4), (-0.3, -0.15), (0.3, -0.15), (0.65, 0.4)]
         for i in range(len(pts)-1):
             canvas.create_line(cx+pts[i][0]*hw, cy+pts[i][1]*hw,
                               cx+pts[i+1][0]*hw, cy+pts[i+1][1]*hw,
-                              fill=color, width=sw)
+                              fill=color, width=sw, **kw)
     elif style == "U":
         pts = [(-0.65, -0.25), (-0.45, 0.35), (0, 0.5), (0.45, 0.35), (0.65, -0.25)]
         for i in range(len(pts)-1):
             canvas.create_line(cx+pts[i][0]*hw, cy+pts[i][1]*hw,
                               cx+pts[i+1][0]*hw, cy+pts[i+1][1]*hw,
-                              fill=color, width=sw)
+                              fill=color, width=sw, **kw)
     elif style == "/":
-        canvas.create_line(cx-hw*0.6, cy+hw*0.4, cx+hw*0.6, cy-hw*0.3, fill=color, width=sw)
+        canvas.create_line(cx-hw*0.6, cy+hw*0.4, cx+hw*0.6, cy-hw*0.3, fill=color, width=sw, **kw)
     elif style == "~":
         for i in range(3):
             x1 = cx - hw*0.65 + i*hw*0.45
-            canvas.create_line(x1, cy+hw*0.25, x1+hw*0.22, cy-hw*0.2, fill=color, width=sw)
+            canvas.create_line(x1, cy+hw*0.25, x1+hw*0.22, cy-hw*0.2, fill=color, width=sw, **kw)
     elif style == "o":
         ro = hw * 0.42
         canvas.create_oval(cx-ro, cy-ro*0.8, cx+ro, cy+ro*0.8,
-                          fill=_PANEL, outline=color, width=max(1, sw))
+                          fill=_PANEL, outline=color, width=max(1, sw), **kw)
     elif style == "!":
-        canvas.create_line(cx, cy-hw*0.3, cx, cy+hw*0.1, fill=color, width=sw)
+        canvas.create_line(cx, cy-hw*0.3, cx, cy+hw*0.1, fill=color, width=sw, **kw)
         canvas.create_oval(cx-hw*0.15, cy+hw*0.28, cx+hw*0.15, cy+hw*0.52,
-                          fill=color, outline="")
+                          fill=color, outline="", **kw)
     else:
         canvas.create_text(cx, cy, text=style, fill=color,
-                          font=("Courier New", max(5, int(hw * 0.85))))
+                          font=("Courier New", max(5, int(hw * 0.85))), **kw)
 
 
 def _draw_robot_full(canvas, cx, cy, s, tilt, arm_l, arm_r, leg_l, leg_r,
-                     eye_l, eye_r, mouth, body_color, glow):
+                     eye_l, eye_r, mouth, body_color, glow, tag=None):
     """Draw a detailed robot. s = scale factor (1.0 ≈ 160px tall reference)."""
-    c  = canvas.create_oval
-    r  = canvas.create_rectangle
-    l  = canvas.create_line
+    if tag:
+        kw = {"tags": tag}
+        c  = lambda *a, **kwargs: canvas.create_oval(*a, **{**kw, **kwargs})
+        r  = lambda *a, **kwargs: canvas.create_rectangle(*a, **{**kw, **kwargs})
+        l  = lambda *a, **kwargs: canvas.create_line(*a, **{**kw, **kwargs})
+    else:
+        kw = {}
+        c  = canvas.create_oval
+        r  = canvas.create_rectangle
+        l  = canvas.create_line
 
     # ── Ground shadow — soft ellipse tinted with body colour ────────────────
     _sr = int(body_color[1:3], 16) // 6
     _sg = int(body_color[3:5], 16) // 6
     _sb = int(body_color[5:7], 16) // 6
     canvas.create_oval(cx-28*s, cy+71*s, cx+28*s, cy+78*s,
-                       fill=f"#{_sr:02x}{_sg:02x}{_sb:02x}", outline="")
+                       fill=f"#{_sr:02x}{_sg:02x}{_sb:02x}", outline="", **kw)
 
     # ── Legs ─────────────────────────────────────────────────────────────────
     for lx, la in [(cx-10*s, leg_l), (cx+10*s, leg_r)]:
@@ -197,7 +206,7 @@ def _draw_robot_full(canvas, cx, cy, s, tilt, arm_l, arm_r, leg_l, leg_r,
     # ── Body ─────────────────────────────────────────────────────────────────
     body_pts = _rounded_rect_points(cx-22*s, cy+7*s, cx+22*s, cy+55*s, 8*s)
     canvas.create_polygon(body_pts, fill=body_color, outline=glow,
-                          width=max(1, int(2*s)), smooth=True)
+                          width=max(1, int(2*s)), smooth=True, **kw)
 
     # Chest panel
     r(cx-13*s, cy+18*s, cx+13*s, cy+39*s, fill=_PANEL, outline=glow, width=1)
@@ -233,20 +242,20 @@ def _draw_robot_full(canvas, cx, cy, s, tilt, arm_l, arm_r, leg_l, leg_r,
     # Head — single rounded shape
     head_pts = _rounded_rect_points(tx-20*s, ty-31*s, tx+20*s, ty+6*s, 9*s)
     canvas.create_polygon(head_pts, fill=body_color, outline=glow,
-                          width=max(1, int(2*s)), smooth=True)
+                          width=max(1, int(2*s)), smooth=True, **kw)
 
     # Eye housings (recessed panels) — rounded rectangles
     eh_l = _rounded_rect_points(tx-17*s, ty-25*s, tx-3*s,  ty-11*s, 3*s)
     eh_r = _rounded_rect_points(tx+3*s,  ty-25*s, tx+17*s, ty-11*s, 3*s)
-    canvas.create_polygon(eh_l, fill=_PANEL, outline=glow, width=1, smooth=True)
-    canvas.create_polygon(eh_r, fill=_PANEL, outline=glow, width=1, smooth=True)
+    canvas.create_polygon(eh_l, fill=_PANEL, outline=glow, width=1, smooth=True, **kw)
+    canvas.create_polygon(eh_r, fill=_PANEL, outline=glow, width=1, smooth=True, **kw)
     # Eyes
-    _draw_eye(canvas, tx-10*s, ty-18*s, 5*s, eye_l, glow)
-    _draw_eye(canvas, tx+10*s, ty-18*s, 5*s, eye_r, glow)
+    _draw_eye(canvas, tx-10*s, ty-18*s, 5*s, eye_l, glow, tag=tag)
+    _draw_eye(canvas, tx+10*s, ty-18*s, 5*s, eye_r, glow, tag=tag)
 
     # Mouth housing
     r(tx-12*s, ty-9*s, tx+12*s, ty-1*s, fill=_PANEL, outline=glow, width=1)
-    _draw_mouth(canvas, tx, ty-5*s, 10*s, mouth, glow)
+    _draw_mouth(canvas, tx, ty-5*s, 10*s, mouth, glow, tag=tag)
 
     # Ear side panels
     r(tx-24*s, ty-22*s, tx-20*s, ty-10*s, fill=glow, outline="")
@@ -309,7 +318,7 @@ class MiniRobotCanvas(tk.Canvas):
             self._scene_frames = 0
             self._scene_length = random.randint(440, 560)
         self._draw()
-        self.after(16, self._tick)
+        self.after(25, self._tick)
 
     def _draw(self):
         self.delete("all")
@@ -538,7 +547,8 @@ class RobotWorldCanvas(tk.Canvas):
         self._clouds  = []
         self._stars   = []
         self._buildings = []
-        self._last_t  = 0.0
+        self._last_t    = 0.0
+        self._static_size = None
 
     def start(self):
         self._animating = True
@@ -645,12 +655,13 @@ class RobotWorldCanvas(tk.Canvas):
         self._last_t = now
         self._frame += 1
         self._update(dt)
-        try:
-            self._draw()
-        except Exception:
-            import traceback
-            traceback.print_exc()
-        self.after(16, self._tick)
+        self._redraw_static_if_needed()
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w >= 10 and h >= 10:
+            self.delete("dynamic")
+            self._draw_dynamic(w, h, self._frame, self._scale)
+        self.after(25, self._tick)
 
     def _update(self, dt: float):
         w = self.winfo_width()
@@ -664,6 +675,7 @@ class RobotWorldCanvas(tk.Canvas):
                 cl["x"] = -cl["r"]
 
     def _draw(self):
+        # Legacy full-redraw path — no longer called by _tick after static/dynamic split.
         self.delete("all")
         w = self.winfo_width()
         h = self.winfo_height()
@@ -671,36 +683,224 @@ class RobotWorldCanvas(tk.Canvas):
             return
         f = self._frame
         s = self._scale
-        try:
-            self._draw_sky(w, h)
-        except Exception:
-            import traceback; traceback.print_exc()
-        try:
-            self._draw_buildings(f)
-        except Exception:
-            import traceback; traceback.print_exc()
-        try:
-            self._draw_road(w, h, f, s)
-        except Exception:
-            import traceback; traceback.print_exc()
-        try:
-            self._draw_cars(f)
-        except Exception:
-            import traceback; traceback.print_exc()
+        self._draw_sky(w, h)
+        self._draw_buildings(f)
+        self._draw_road(w, h, f, s)
+        self._draw_cars(f)
         for a in sorted(self._agents, key=lambda a: a.ground_y):
-            try:
-                self._draw_agent(a, f)
-            except Exception:
-                import traceback; traceback.print_exc()
-        try:
-            self._draw_ground_details(w, h, s, f)
-        except Exception:
-            import traceback; traceback.print_exc()
+            self._draw_agent(a, f)
+        self._draw_ground_details(w, h, s, f)
         if self._scene == "tubby":
-            try:
-                self._draw_bubbles(w, f)
-            except Exception:
-                import traceback; traceback.print_exc()
+            self._draw_bubbles(w, f)
+
+    def _redraw_static_if_needed(self):
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w < 10 or h < 10:
+            return
+        if self._static_size != (w, h):
+            self.delete("static")
+            self._draw_static(w, h)
+            self._static_size = (w, h)
+
+    def _draw_static(self, w: int, h: int):
+        """Draw all non-animating background geometry once, tagged 'static'."""
+        s        = self._scale
+        ground_y = h * 0.72
+        road_y   = h * 0.8
+        self._ground_y = ground_y
+        self._road_y   = road_y
+        sky_h = int(h * 0.72)
+        scene = self._scene
+
+        # ── Sky background + celestial body ───────────────────────────────────
+        if scene == "sleeping":
+            self.create_rectangle(0, 0, w, sky_h, fill=_SKY, outline="", tags="static")
+            self.create_oval(w*0.3, h*0.0, w*0.75, h*0.35,
+                           fill="#0f0528", outline="", tags="static")
+            mx, my = w*0.88, h*0.17
+            mr = s * 18
+            for ring in [mr*2.2, mr*1.6, mr*1.2]:
+                ar = int(10 + (mr*2.2-ring)/mr*15)
+                self.create_oval(mx-ring, my-ring, mx+ring, my+ring,
+                               fill=f"#{ar:02x}{ar//2:02x}00", outline="", tags="static")
+            self.create_oval(mx-mr, my-mr, mx+mr, my+mr, fill=_MOON, outline="", tags="static")
+            self.create_oval(mx+mr*0.28, my-mr*1.12, mx+mr*1.28, my+mr*0.88,
+                           fill=_SKY, outline="", tags="static")
+        else:
+            if scene == "lunch":
+                top_col, bot_col, sun_col = _DAY_SKY_TOP, _DAY_SKY_BOT, _MOON
+            elif scene == "fixing":
+                top_col, bot_col, sun_col = _OVER_SKY_TOP, _OVER_SKY_BOT, "#c0c0a0"
+            elif scene == "kita_goodbye":
+                top_col, bot_col, sun_col = _WARM_SKY_TOP, _WARM_SKY_BOT, _MOON
+            else:
+                top_col, bot_col, sun_col = _EVE_SKY_TOP, _EVE_SKY_BOT, "#f4a261"
+            self.create_rectangle(0, 0, w, sky_h//2, fill=top_col, outline="", tags="static")
+            self.create_rectangle(0, sky_h//2, w, sky_h, fill=bot_col, outline="", tags="static")
+            sr2 = max(6, int(s * 16))
+            ssx, ssy = int(w * 0.82), int(h * 0.15)
+            for ring in [sr2*2.4, sr2*1.7, sr2*1.25]:
+                ri2 = int(ring)
+                ri  = int(ring*255//(sr2*2.4))
+                self.create_oval(ssx-ri2, ssy-ri2, ssx+ri2, ssy+ri2,
+                               fill=f"#{ri:02x}{ri*3//4:02x}00", outline="", tags="static")
+            self.create_oval(ssx-sr2, ssy-sr2, ssx+sr2, ssy+sr2,
+                           fill=sun_col, outline="", tags="static")
+
+        # ── Buildings (bodies, windows, sign housings, antennas) ──────────────
+        for b in self._buildings:
+            bx, bwb, bhb = b["x"], b["w"], b["h"]
+            by = ground_y - bhb
+            self.create_rectangle(bx, by, bx+bwb, ground_y,
+                                fill=_DIM, outline="#1a0e3a", tags="static")
+            self.create_rectangle(bx, by, bx+bwb, by+int(bhb*0.3),
+                                fill="#1e1040", outline="", tags="static")
+            for (wx, wy, lit) in b["windows"]:
+                wsc = _MOON if lit else "#0c0416"
+                ws  = max(3, int(bwb*0.12))
+                self.create_rectangle(bx+wx, by+wy, bx+wx+ws, by+wy+ws,
+                                    fill=wsc, outline="", tags="static")
+            if b.get("sign") and b.get("sign_text"):
+                sc2  = b["sign_col"]
+                swb  = min(bwb-8, int(bwb*0.85))
+                shb  = int(12*s)
+                sxb  = bx + (bwb-swb)//2
+                syb  = by + int(bhb*0.12)
+                _r3 = int(sc2[1:3], 16) // 8
+                _g3 = int(sc2[3:5], 16) // 8
+                _b3 = int(sc2[5:7], 16) // 8
+                self.create_rectangle(sxb-2, syb-2, sxb+swb+2, syb+shb+2,
+                                    fill=f"#{_r3:02x}{_g3:02x}{_b3:02x}", outline="", tags="static")
+                self.create_rectangle(sxb, syb, sxb+swb, syb+shb,
+                                    fill="#08020e", outline=sc2, width=1, tags="static")
+            mid = bx + bwb//2
+            self.create_line(mid, by, mid, by-int(8*s), fill=_GLOW, width=1, tags="static")
+            self.create_oval(mid-2, by-int(11*s), mid+2, by-int(7*s),
+                           fill=_RED, outline="", tags="static")
+
+        # ── Road surface + kerbs ──────────────────────────────────────────────
+        road_h = max(4, int(h*0.07))
+        self.create_rectangle(0, road_y, w, road_y+road_h,
+                            fill=_ROAD, outline="", tags="static")
+        self.create_line(0, road_y, w, road_y,
+                       fill="#2a1a5e", width=max(1, int(2*s)), tags="static")
+        self.create_line(0, road_y+road_h, w, road_y+road_h,
+                       fill="#2a1a5e", width=max(1, int(2*s)), tags="static")
+
+        # ── Ground + grass tufts ──────────────────────────────────────────────
+        gy = ground_y
+        is_night   = (scene == "sleeping")
+        ground_col = _GROUND if is_night else _DAY_GROUND
+        edge_col   = "#200d44" if is_night else _DAY_GROUND_DK
+        self.create_rectangle(0, gy, w, h, fill=ground_col, outline="", tags="static")
+        self.create_rectangle(0, gy, w, gy+int(4*s), fill=edge_col, outline="", tags="static")
+        grass_step = max(1, int(20*s))
+        jitter_mod = max(1, int(8*s))
+        ht_mod     = max(1, int(4*s))
+        for gx in range(0, w, grass_step):
+            jitter = (gx*7919) % jitter_mod
+            ht = max(1, int(5*s)) + jitter % ht_mod
+            self.create_line(gx, gy, gx, gy-ht,
+                           fill="#1e3a1e", width=max(1, int(2*s)), tags="static")
+            self.create_line(gx+int(3*s), gy, gx+int(3*s), gy-ht+int(2*s),
+                           fill="#1e3a1e", width=max(1, int(2*s)), tags="static")
+
+        # ── Lamp post poles + housings ────────────────────────────────────────
+        for lx in range(int(w*0.15), w, int(w//5)):
+            pole_h = int(50*s)
+            self.create_line(lx, gy, lx, gy-pole_h,
+                           fill="#2a1a5e", width=max(2, int(3*s)), tags="static")
+            self.create_rectangle(lx-int(6*s), gy-pole_h-int(4*s),
+                                lx+int(6*s), gy-pole_h,
+                                fill="#2a1a5e", outline=_GLOW, width=1, tags="static")
+
+    def _draw_dynamic(self, w: int, h: int, f: int, s: float):
+        """Draw all animated items every frame, tagged 'dynamic'."""
+        ground_y = self._ground_y
+        road_y   = self._road_y
+        scene    = self._scene
+
+        # ── Stars (sleeping scene) ────────────────────────────────────────────
+        if scene == "sleeping":
+            for st in self._stars:
+                st["a"] = max(0.05, min(1.0, st["a"] + st["da"]))
+                if st["a"] <= 0.05 or st["a"] >= 1.0:
+                    st["da"] *= -1
+                col = st["col"]
+                x, y, r = st["x"], st["y"], st["r"] * (0.8 + 0.2*st["a"])
+                self.create_oval(x-r, y-r, x+r, y+r,
+                               fill=col, outline="", tags="dynamic")
+
+        # ── Clouds ────────────────────────────────────────────────────────────
+        for cl in self._clouds:
+            if scene == "sleeping":
+                br = int(cl["alpha"] * 65)
+                col = f"#{br+8:02x}{br:02x}{br+22:02x}"
+            else:
+                col = "#deeeff"
+            cr = cl["r"]
+            cx2, cy2 = cl["x"], cl["y"]
+            for dx, dy, dr in [(0, 0, 1.0), (-cr*0.55, -cr*0.25, 0.65),
+                               (cr*0.55, -cr*0.2, 0.65), (0, -cr*0.4, 0.72)]:
+                rr = cr*dr
+                self.create_oval(cx2+dx-rr, cy2+dy-rr, cx2+dx+rr, cy2+dy+rr,
+                               fill=col, outline="", tags="dynamic")
+
+        # ── Building sign texts ───────────────────────────────────────────────
+        for b in self._buildings:
+            if b.get("sign") and b.get("sign_text"):
+                sc2  = b["sign_col"]
+                bx   = b["x"]
+                bwb  = b["w"]
+                bhb  = b["h"]
+                swb  = min(bwb-8, int(bwb*0.85))
+                shb  = int(12*s)
+                sxb  = bx + (bwb-swb)//2
+                syb  = (ground_y - bhb) + int(bhb*0.12)
+                pulse = 0.7 + 0.3*math.sin(f*0.06*_PHASE + bx)
+                fill_c = sc2 if pulse > 0.8 else "#333333"
+                self.create_text(sxb+swb//2, syb+shb//2, text=b["sign_text"],
+                               font=("Courier New", max(5, int(7*s)), "bold"),
+                               fill=fill_c, anchor="center", tags="dynamic")
+
+        # ── Lane dashes ───────────────────────────────────────────────────────
+        road_h   = max(4, int(h*0.07))
+        dash_w   = max(4, int(28*s))
+        dash_gap = max(2, int(20*s))
+        offset   = int(f*1.5) % (dash_w+dash_gap)
+        ly = road_y + road_h//2
+        x = -dash_gap + offset
+        while x < w + dash_w:
+            self.create_line(x, ly, x+dash_w, ly, fill="#2a2a44",
+                           width=max(1, int(2*s)), dash=(4, 4), tags="dynamic")
+            x += dash_w + dash_gap
+
+        # ── Lamp halos + emoji ────────────────────────────────────────────────
+        gy = ground_y
+        for lx in range(int(w*0.15), w, int(w//5)):
+            pole_h = int(50*s)
+            pulse = 0.4 + 0.2*math.sin(f*0.04*_PHASE + lx)
+            gb = int(pulse*80)
+            glow_col = f"#{gb:02x}{min(255, gb*2+50):02x}{gb:02x}"
+            for ring_r in [int(18*s), int(12*s)]:
+                self.create_oval(lx-ring_r, gy-pole_h-ring_r,
+                               lx+ring_r, gy-pole_h+int(8*s),
+                               fill=glow_col, outline="", tags="dynamic")
+            self.create_text(lx, gy-pole_h-int(2*s), text="💡",
+                           font=("", max(6, int(8*s))), anchor="center", tags="dynamic")
+
+        # ── Cars ──────────────────────────────────────────────────────────────
+        for car in self._cars:
+            self._draw_car(car, f, s)
+
+        # ── Agents ────────────────────────────────────────────────────────────
+        for a in sorted(self._agents, key=lambda a: a.ground_y):
+            self._draw_agent(a, f)
+
+        # ── Bubbles (tubby scene) ─────────────────────────────────────────────
+        if scene == "tubby":
+            self._draw_bubbles(w, f)
 
     def _draw_sky(self, w, h):
         sky_h = int(h * 0.72)
@@ -849,43 +1049,44 @@ class RobotWorldCanvas(tk.Canvas):
         x0, x1 = x-cw//2, x+cw//2
         # Shadow
         self.create_oval(x0+int(4*s), y+int(1*s), x1-int(4*s), y+int(5*s),
-                        fill="#060812", outline="")
+                        fill="#060812", outline="", tags="dynamic")
         # Body
-        self.create_rectangle(x0, y-ch, x1, y, fill=car.body_col, outline="")
+        self.create_rectangle(x0, y-ch, x1, y, fill=car.body_col, outline="", tags="dynamic")
         # Cab
         cab = int(8*s)
         self.create_rectangle(x0+cab, y-ch-int(14*s), x1-cab, y-ch+int(4*s),
-                             fill=car.body_col, outline="")
+                             fill=car.body_col, outline="", tags="dynamic")
         self.create_oval(x0+cab, y-ch-int(14*s), x1-cab, y-ch+int(4*s),
-                        fill=car.body_col, outline="")
+                        fill=car.body_col, outline="", tags="dynamic")
         # Windows
         self.create_rectangle(x0+cab+int(3*s), y-ch-int(11*s),
                              x1-cab-int(3*s), y-ch+int(2*s),
-                             fill=car.win_col, outline="")
+                             fill=car.win_col, outline="", tags="dynamic")
         # Wheels
         roll = int(x/3) % 360
         for wx in [x0+int(10*s), x1-int(10*s)]:
-            self.create_oval(wx-wr, y-wr, wx+wr, y+wr, fill="#111133", outline=_GLOW, width=1)
+            self.create_oval(wx-wr, y-wr, wx+wr, y+wr,
+                           fill="#111133", outline=_GLOW, width=1, tags="dynamic")
             ang = math.radians(roll)
             self.create_line(wx, y, wx+int(wr*0.8*math.cos(ang)), y+int(wr*0.8*math.sin(ang)),
-                           fill=_GLOW, width=1)
+                           fill=_GLOW, width=1, tags="dynamic")
         # Emoji passenger
         self.create_text((x0+x1)//2, y-ch-int(4*s), text=car.emoji,
-                        font=("", max(7, int(10*s))), anchor="center")
+                        font=("", max(7, int(10*s))), anchor="center", tags="dynamic")
         # Lights with glow
         light_col = _MOON if d > 0 else _RED
         self.create_oval(x1-int(5*s), y-int(11*s), x1+int(3*s), y-int(3*s),
-                        fill=light_col, outline="")
-        # Glow halo for headlight — dim version of headlight colour (6 hex digits)
+                        fill=light_col, outline="", tags="dynamic")
+        # Glow halo for headlight
         gl = int(8*s)
         _lr = int(light_col[1:3], 16) // 5
         _lg = int(light_col[3:5], 16) // 5
         _lb = int(light_col[5:7], 16) // 5
         self.create_oval(x1-gl, y-gl, x1+gl, y,
-                        fill=f"#{_lr:02x}{_lg:02x}{_lb:02x}", outline="")
+                        fill=f"#{_lr:02x}{_lg:02x}{_lb:02x}", outline="", tags="dynamic")
         back_col = _RED if d > 0 else _MOON
         self.create_oval(x0-int(3*s), y-int(11*s), x0+int(5*s), y-int(3*s),
-                        fill=back_col, outline="")
+                        fill=back_col, outline="", tags="dynamic")
 
     def _draw_ground_details(self, w, h, s, f):
         gy = self._ground_y
@@ -928,15 +1129,12 @@ class RobotWorldCanvas(tk.Canvas):
         for i in range(22):
             seed = i * 137
             bx  = (seed * 19 + f * 1) % w
-            # Bubbles rise from ground upward; wrap at top
             by  = gy - ((seed * 11 + f + i * 17) % int(gy + 10))
             br  = 4 + (seed % 6)
-            # Translucent bubble ring
             self.create_oval(bx-br, by-br, bx+br, by+br,
-                           fill="", outline=_EVE_SKY_BOT, width=1)
-            # Small specular highlight
+                           fill="", outline=_EVE_SKY_BOT, width=1, tags="dynamic")
             self.create_oval(bx-br//3, by-br*0.7, bx, by-br*0.3,
-                           fill="#ffffff", outline="")
+                           fill="#ffffff", outline="", tags="dynamic")
 
     def _draw_agent(self, agent: _RobotAgent, f: int):
         act_name = agent.activity
@@ -975,17 +1173,19 @@ class RobotWorldCanvas(tk.Canvas):
             arm_l, arm_r = arm_r, arm_l
             leg_l, leg_r = leg_r, leg_l
 
-        # Body: 50 % brightness of the agent's glow colour with a per-channel
-        # floor so robots are readable against both night and daytime skies.
-        try:
-            _br = max(30, int(agent.color[1:3], 16) // 2)
-            _bg = max(20, int(agent.color[3:5], 16) // 2)
-            _bb = max(25, int(agent.color[5:7], 16) // 2)
-            body_col = f"#{_br:02x}{_bg:02x}{_bb:02x}"
-        except Exception:
-            body_col = "#1e2a40"
-        _draw_robot_full(self, cx, cy+bob, s, tilt, arm_l, arm_r, leg_l, leg_r,
-                         eye_l, eye_r, mouth, body_col, agent.color)
+        # ── Pixel sprite — replaces _draw_robot_full ─────────────────────────
+        # pixel_size: 3 for main-row agents, 2 for background/road agents.
+        # cy_sprite: offset so the sprite bottom (row 23) lands exactly on the
+        #            visual ground line (agent.ground_y + 78*agent.scale).
+        pixel_size = 3 if agent.scale >= self._scale * 0.9 else 2
+        cy_sprite  = int(agent.ground_y + 78 * agent.scale - 12 * pixel_size + bob)
+        agent_palette = dict(DEFAULT_PALETTE)
+        agent_palette["G"] = agent.color
+        draw_pixel_sprite(self, ROBOT_IDLE, int(cx), cy_sprite, pixel_size,
+                          palette=agent_palette, tags="dynamic",
+                          flip=(d < 0))
+        # _draw_robot_full(self, cx, cy+bob, s, tilt, arm_l, arm_r, leg_l, leg_r,
+        #                  eye_l, eye_r, mouth, body_col, agent.color, tag="dynamic")
 
         # Emoji prop with glow halo
         prop_y = cy + bob - s*54
@@ -995,19 +1195,19 @@ class RobotWorldCanvas(tk.Canvas):
             prop_y = cy + bob - s*20
         hr = int(10*s)
         self.create_oval(cx-hr, prop_y-hr, cx+hr, prop_y+hr,
-                        fill=agent.color, outline="")
+                        fill=agent.color, outline="", tags="dynamic")
         self.create_text(cx, prop_y, text=agent.emoji,
-                        font=("", max(7, int(13*s))), anchor="center")
+                        font=("", max(7, int(13*s))), anchor="center", tags="dynamic")
 
         # Skateboard
         if act_name == "skate":
             bw = int(28*s)
             self.create_rectangle(cx-bw//2, cy+int(68*s), cx+bw//2, cy+int(72*s),
-                                 fill=_TEAL, outline="")
+                                 fill=_TEAL, outline="", tags="dynamic")
             for wx in [-int(8*s), int(8*s)]:
                 self.create_oval(cx+wx-int(3*s), cy+int(70*s),
                                 cx+wx+int(3*s), cy+int(76*s),
-                                fill="#111133", outline=_GLOW, width=1)
+                                fill="#111133", outline=_GLOW, width=1, tags="dynamic")
 
         # Sleep Zzz
         if act_name == "sleep":
@@ -1015,12 +1215,14 @@ class RobotWorldCanvas(tk.Canvas):
             for i in range(zp+1):
                 self.create_text(cx+int((18+i*10)*s), cy+bob-int((30+i*10)*s),
                                text="z", fill=_TEAL,
-                               font=("Courier New", max(6, int((6+i*3)*s)), "bold"))
+                               font=("Courier New", max(6, int((6+i*3)*s)), "bold"),
+                               tags="dynamic")
 
         # Food prop when eating
         if act_name == "eat":
             self.create_text(cx+int(30*s), cy+bob-int(10*s),
-                           text="🍕", font=("", max(7, int(11*s))), anchor="center")
+                           text="🍕", font=("", max(7, int(11*s))), anchor="center",
+                           tags="dynamic")
 
     def _draw_robot(self, cx, cy, s, opts):
         """Legacy wrapper — kept for compatibility."""
@@ -1079,7 +1281,7 @@ class RobotCanvas(tk.Canvas):
             return
         self.frame += 1
         self._draw()
-        self.after(16, self._tick)
+        self.after(25, self._tick)
 
     def _draw(self):
         self.delete("all")
