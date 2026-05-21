@@ -14,7 +14,8 @@ import tkinter as tk
 
 from config import SCENES
 from schedule import next_on_time
-from pixel_sprites import draw_pixel_sprite, ROBOT_IDLE, DEFAULT_PALETTE
+from pixel_sprites import (draw_pixel_sprite, DEFAULT_PALETTE,
+                           ROBOT_SPRITES, ACTIVITY_FRAME_RATE)
 
 _MINI_SCENES = ["sleeping", "lunch", "working"]
 
@@ -1181,19 +1182,29 @@ class RobotWorldCanvas(tk.Canvas):
         cy_sprite  = int(agent.ground_y + 78 * agent.scale - 12 * pixel_size + bob)
         agent_palette = dict(DEFAULT_PALETTE)
         agent_palette["G"] = agent.color
-        draw_pixel_sprite(self, ROBOT_IDLE, int(cx), cy_sprite, pixel_size,
+
+        frames     = ROBOT_SPRITES.get(act_name, ROBOT_SPRITES["idle"])
+        frame_rate = ACTIVITY_FRAME_RATE.get(act_name, 0.18)
+        anim_phase = f * frame_rate * _PHASE + agent.phase
+        frame_idx  = int(anim_phase * len(frames) / (2 * math.pi)) % len(frames)
+
+        draw_pixel_sprite(self, frames[frame_idx], int(cx), cy_sprite, pixel_size,
                           palette=agent_palette, tags="dynamic",
                           flip=(d < 0))
         # _draw_robot_full(self, cx, cy+bob, s, tilt, arm_l, arm_r, leg_l, leg_r,
         #                  eye_l, eye_r, mouth, body_col, agent.color, tag="dynamic")
 
-        # Emoji prop with glow halo
-        prop_y = cy + bob - s*54
+        # Emoji prop with glow halo.
+        # prop_y is expressed relative to cy_sprite / pixel_size so it sits
+        # correctly against the pixel sprite (not the old procedural robot).
+        hr = int(10 * s)
+        sprite_top = cy_sprite - 12 * pixel_size   # top edge of the sprite
         if act_name == "carry":
-            prop_y = cy + bob - s*32
+            prop_y = cy_sprite + 3 * pixel_size    # arm / chest height
         elif act_name == "sleep":
-            prop_y = cy + bob - s*20
-        hr = int(10*s)
+            prop_y = sprite_top - hr - pixel_size  # just above sprite (same as default)
+        else:
+            prop_y = sprite_top - hr - pixel_size  # just above antenna tips
         self.create_oval(cx-hr, prop_y-hr, cx+hr, prop_y+hr,
                         fill=agent.color, outline="", tags="dynamic")
         self.create_text(cx, prop_y, text=agent.emoji,
@@ -1218,9 +1229,9 @@ class RobotWorldCanvas(tk.Canvas):
                                font=("Courier New", max(6, int((6+i*3)*s)), "bold"),
                                tags="dynamic")
 
-        # Food prop when eating
+        # Food prop when eating — placed beside the robot at arm height
         if act_name == "eat":
-            self.create_text(cx+int(30*s), cy+bob-int(10*s),
+            self.create_text(cx + int(30*s), cy_sprite + 3 * pixel_size,
                            text="🍕", font=("", max(7, int(11*s))), anchor="center",
                            tags="dynamic")
 
