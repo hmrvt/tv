@@ -37,7 +37,6 @@ _MOON        = "#FFD93D"
 _RED         = "#FF6B6B"
 _TEAL        = "#4ECDC4"
 _DARK_BODY   = "#1a0a3e"
-_PANEL       = "#04080f"
 _STAR_COLS   = ["#ffffff", "#aaccff", "#ffeeaa", "#ccffee", "#ffccee"]
 
 # Daytime / scene sky palettes
@@ -95,180 +94,8 @@ def _eased_sin(phase: float) -> float:
     return sign * a * a * (3 - 2 * a)
 
 
-def _rounded_rect_points(x1, y1, x2, y2, radius):
-    """Flat point list for create_polygon(smooth=True) rounded rectangle."""
-    r = radius
-    return [
-        x1 + r, y1,   x2 - r, y1,
-        x2,     y1,   x2,     y1 + r,
-        x2,     y2 - r, x2,   y2,
-        x2 - r, y2,   x1 + r, y2,
-        x1,     y2,   x1,     y2 - r,
-        x1,     y1 + r, x1,   y1,
-    ]
 
 
-def _draw_eye(canvas, cx, cy, r, style, color, tag=None):
-    """Draw a robot eye at (cx, cy) with radius r."""
-    kw = {"tags": tag} if tag else {}
-    r = max(1.5, r)
-    if style == "●":
-        canvas.create_oval(cx-r, cy-r, cx+r, cy+r, fill=color, outline="", **kw)
-        hr = r * 0.35
-        canvas.create_oval(cx-r*0.55, cy-r*0.6, cx-r*0.55+hr, cy-r*0.6+hr,
-                           fill="#ffffff", outline="", **kw)
-    elif style == "◉":
-        canvas.create_oval(cx-r, cy-r, cx+r, cy+r, fill=color, outline="", **kw)
-        canvas.create_oval(cx-r*0.5, cy-r*0.5, cx+r*0.5, cy+r*0.5, fill="#000820", outline="", **kw)
-        canvas.create_oval(cx-r*0.2, cy-r*0.2, cx+r*0.2, cy+r*0.2, fill=color, outline="", **kw)
-    elif style == "—":
-        canvas.create_line(cx-r*0.85, cy, cx+r*0.85, cy,
-                          fill=color, width=max(1, int(r*0.5)), **kw)
-    elif style in ("^", "*"):
-        w = max(1, int(r * 0.45))
-        canvas.create_line(cx-r, cy+r*0.3, cx, cy-r*0.6, fill=color, width=w, **kw)
-        canvas.create_line(cx, cy-r*0.6, cx+r, cy+r*0.3, fill=color, width=w, **kw)
-    elif style == "·":
-        canvas.create_oval(cx-r*0.4, cy-r*0.4, cx+r*0.4, cy+r*0.4, fill=color, outline="", **kw)
-    elif style == "X":
-        w = max(1, int(r * 0.4))
-        canvas.create_line(cx-r*0.7, cy-r*0.7, cx+r*0.7, cy+r*0.7, fill=color, width=w, **kw)
-        canvas.create_line(cx+r*0.7, cy-r*0.7, cx-r*0.7, cy+r*0.7, fill=color, width=w, **kw)
-    else:
-        canvas.create_text(cx, cy, text=style, fill=color,
-                          font=("Courier New", max(5, int(r * 1.7))), **kw)
-
-
-def _draw_mouth(canvas, cx, cy, hw, style, color, tag=None):
-    """Draw a robot mouth. hw = half-width of the mouth area."""
-    kw = {"tags": tag} if tag else {}
-    sw = max(1, int(hw * 0.22))
-    if style == "—":
-        canvas.create_line(cx-hw*0.7, cy, cx+hw*0.7, cy, fill=color, width=sw, **kw)
-    elif style in ("D", ")"):
-        pts = [(-0.65, 0.4), (-0.3, -0.15), (0.3, -0.15), (0.65, 0.4)]
-        for i in range(len(pts)-1):
-            canvas.create_line(cx+pts[i][0]*hw, cy+pts[i][1]*hw,
-                              cx+pts[i+1][0]*hw, cy+pts[i+1][1]*hw,
-                              fill=color, width=sw, **kw)
-    elif style == "U":
-        pts = [(-0.65, -0.25), (-0.45, 0.35), (0, 0.5), (0.45, 0.35), (0.65, -0.25)]
-        for i in range(len(pts)-1):
-            canvas.create_line(cx+pts[i][0]*hw, cy+pts[i][1]*hw,
-                              cx+pts[i+1][0]*hw, cy+pts[i+1][1]*hw,
-                              fill=color, width=sw, **kw)
-    elif style == "/":
-        canvas.create_line(cx-hw*0.6, cy+hw*0.4, cx+hw*0.6, cy-hw*0.3, fill=color, width=sw, **kw)
-    elif style == "~":
-        for i in range(3):
-            x1 = cx - hw*0.65 + i*hw*0.45
-            canvas.create_line(x1, cy+hw*0.25, x1+hw*0.22, cy-hw*0.2, fill=color, width=sw, **kw)
-    elif style == "o":
-        ro = hw * 0.42
-        canvas.create_oval(cx-ro, cy-ro*0.8, cx+ro, cy+ro*0.8,
-                          fill=_PANEL, outline=color, width=max(1, sw), **kw)
-    elif style == "!":
-        canvas.create_line(cx, cy-hw*0.3, cx, cy+hw*0.1, fill=color, width=sw, **kw)
-        canvas.create_oval(cx-hw*0.15, cy+hw*0.28, cx+hw*0.15, cy+hw*0.52,
-                          fill=color, outline="", **kw)
-    else:
-        canvas.create_text(cx, cy, text=style, fill=color,
-                          font=("Courier New", max(5, int(hw * 0.85))), **kw)
-
-
-def _draw_robot_full(canvas, cx, cy, s, tilt, arm_l, arm_r, leg_l, leg_r,
-                     eye_l, eye_r, mouth, body_color, glow, tag=None):
-    """Draw a detailed robot. s = scale factor (1.0 ≈ 160px tall reference)."""
-    if tag:
-        kw = {"tags": tag}
-        c  = lambda *a, **kwargs: canvas.create_oval(*a, **{**kw, **kwargs})
-        r  = lambda *a, **kwargs: canvas.create_rectangle(*a, **{**kw, **kwargs})
-        l  = lambda *a, **kwargs: canvas.create_line(*a, **{**kw, **kwargs})
-    else:
-        kw = {}
-        c  = canvas.create_oval
-        r  = canvas.create_rectangle
-        l  = canvas.create_line
-
-    # ── Ground shadow — soft ellipse tinted with body colour ────────────────
-    _sr = int(body_color[1:3], 16) // 6
-    _sg = int(body_color[3:5], 16) // 6
-    _sb = int(body_color[5:7], 16) // 6
-    canvas.create_oval(cx-28*s, cy+71*s, cx+28*s, cy+78*s,
-                       fill=f"#{_sr:02x}{_sg:02x}{_sb:02x}", outline="", **kw)
-
-    # ── Legs ─────────────────────────────────────────────────────────────────
-    for lx, la in [(cx-10*s, leg_l), (cx+10*s, leg_r)]:
-        l(lx, cy+50*s, lx + la*s, cy+72*s,
-          fill=glow, width=max(2, int(5*s)), capstyle=tk.ROUND)
-    # Boot soles (rounded ovals)
-    c(cx-21*s+leg_l*s, cy+68*s, cx-1*s+leg_l*s,  cy+78*s, fill=glow, outline="")
-    c(cx+1*s+leg_r*s,  cy+68*s, cx+21*s+leg_r*s, cy+78*s, fill=glow, outline="")
-
-    # ── Body ─────────────────────────────────────────────────────────────────
-    body_pts = _rounded_rect_points(cx-22*s, cy+7*s, cx+22*s, cy+55*s, 8*s)
-    canvas.create_polygon(body_pts, fill=body_color, outline=glow,
-                          width=max(1, int(2*s)), smooth=True, **kw)
-
-    # Chest panel
-    r(cx-13*s, cy+18*s, cx+13*s, cy+39*s, fill=_PANEL, outline=glow, width=1)
-    # LED indicator row
-    for i, dot_c in enumerate([glow, _MOON, _RED]):
-        dx = cx + (-7 + i*7) * s
-        c(dx-2*s, cy+21*s, dx+2*s, cy+25*s, fill=dot_c, outline="")
-    # Chest scan lines
-    for yi in range(3):
-        yh = cy + (29 + yi*3)*s
-        l(cx-9*s, yh, cx+9*s, yh, fill="#003322", width=1)
-    # Vent slots at bottom of body
-    for yi in range(2):
-        yh = cy + (41 + yi*3)*s
-        l(cx-10*s, yh, cx+10*s, yh, fill=glow, width=1)
-
-    # ── Arms ─────────────────────────────────────────────────────────────────
-    l(cx-22*s, cy+22*s, cx-34*s, cy+22*s+arm_l*s,
-      fill=glow, width=max(2, int(5*s)), capstyle=tk.ROUND)
-    c(cx-38*s, cy+18*s+arm_l*s, cx-30*s, cy+26*s+arm_l*s, fill=glow, outline="")
-    l(cx+22*s, cy+22*s, cx+34*s, cy+22*s+arm_r*s,
-      fill=glow, width=max(2, int(5*s)), capstyle=tk.ROUND)
-    c(cx+30*s, cy+18*s+arm_r*s, cx+38*s, cy+26*s+arm_r*s, fill=glow, outline="")
-
-    # ── Neck ─────────────────────────────────────────────────────────────────
-    r(cx-5*s, cy+2*s, cx+5*s, cy+12*s, fill=body_color, outline=glow, width=1)
-    l(cx-4*s, cy+5*s,  cx+4*s, cy+5*s,  fill=glow, width=1)
-    l(cx-4*s, cy+9*s,  cx+4*s, cy+9*s,  fill=glow, width=1)
-
-    # ── Head ─────────────────────────────────────────────────────────────────
-    tx = cx + tilt * 0.4
-    ty = cy - 8*s
-    # Head — single rounded shape
-    head_pts = _rounded_rect_points(tx-20*s, ty-31*s, tx+20*s, ty+6*s, 9*s)
-    canvas.create_polygon(head_pts, fill=body_color, outline=glow,
-                          width=max(1, int(2*s)), smooth=True, **kw)
-
-    # Eye housings (recessed panels) — rounded rectangles
-    eh_l = _rounded_rect_points(tx-17*s, ty-25*s, tx-3*s,  ty-11*s, 3*s)
-    eh_r = _rounded_rect_points(tx+3*s,  ty-25*s, tx+17*s, ty-11*s, 3*s)
-    canvas.create_polygon(eh_l, fill=_PANEL, outline=glow, width=1, smooth=True, **kw)
-    canvas.create_polygon(eh_r, fill=_PANEL, outline=glow, width=1, smooth=True, **kw)
-    # Eyes
-    _draw_eye(canvas, tx-10*s, ty-18*s, 5*s, eye_l, glow, tag=tag)
-    _draw_eye(canvas, tx+10*s, ty-18*s, 5*s, eye_r, glow, tag=tag)
-
-    # Mouth housing
-    r(tx-12*s, ty-9*s, tx+12*s, ty-1*s, fill=_PANEL, outline=glow, width=1)
-    _draw_mouth(canvas, tx, ty-5*s, 10*s, mouth, glow, tag=tag)
-
-    # Ear side panels
-    r(tx-24*s, ty-22*s, tx-20*s, ty-10*s, fill=glow, outline="")
-    r(tx+20*s, ty-22*s, tx+24*s, ty-10*s, fill=glow, outline="")
-
-    # ── Antenna ──────────────────────────────────────────────────────────────
-    l(tx, ty-28*s, tx, ty-47*s, fill=glow, width=max(1, int(2*s)))
-    # Antenna tip — glow rings in the agent's own colour
-    c(tx-6*s, ty-53*s, tx+6*s, ty-41*s, fill=body_color, outline="")
-    c(tx-4*s, ty-51*s, tx+4*s, ty-43*s, fill=glow, outline="")
-    c(tx-2*s, ty-49*s, tx+2*s, ty-45*s, fill="#ffffff", outline="")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -367,8 +194,7 @@ class MiniRobotCanvas(tk.Canvas):
     def _draw_mini_robot(self, cx, cy_body, s, activity):
         """Draw the pixel-art robot for a mini scene.
 
-        cy_body is the body-centre coordinate (same convention as the old
-        _draw_robot_full); visual ground = cy_body + 78*s.
+        cy_body is the body-centre coordinate; visual ground = cy_body + 78*s.
         Returns (sprite_top_y, sprite_bottom_y) for prop placement.
         """
         pixel_size    = 2
@@ -1189,7 +1015,6 @@ class RobotWorldCanvas(tk.Canvas):
             arm_l, arm_r = arm_r, arm_l
             leg_l, leg_r = leg_r, leg_l
 
-        # ── Pixel sprite — replaces _draw_robot_full ─────────────────────────
         # pixel_size: 3 for main-row agents, 2 for background/road agents.
         # cy_sprite: offset so the sprite bottom (row 23) lands exactly on the
         #            visual ground line (agent.ground_y + 78*agent.scale).
@@ -1212,9 +1037,6 @@ class RobotWorldCanvas(tk.Canvas):
                           face=face_variant,
                           accessory=accessory,
                           accessory_color=agent.accessory_color)
-        # _draw_robot_full(self, cx, cy+bob, s, tilt, arm_l, arm_r, leg_l, leg_r,
-        #                  eye_l, eye_r, mouth, body_col, agent.color, tag="dynamic")
-
         # Emoji prop with glow halo.
         # prop_y is expressed relative to cy_sprite / pixel_size so it sits
         # correctly against the pixel sprite (not the old procedural robot).
@@ -1256,20 +1078,6 @@ class RobotWorldCanvas(tk.Canvas):
                            text="🍕", font=("", max(7, int(11*s))), anchor="center",
                            tags="dynamic")
 
-    def _draw_robot(self, cx, cy, s, opts):
-        """Legacy wrapper — kept for compatibility."""
-        tilt  = opts.get("tilt", 0)
-        arm_l = opts.get("arm_l", 0)
-        arm_r = opts.get("arm_r", 0)
-        leg_l = opts.get("leg_l", 0)
-        leg_r = opts.get("leg_r", 0)
-        eye_l = opts.get("eye_l", "●")
-        eye_r = opts.get("eye_r", "●")
-        mouth = opts.get("mouth", "—")
-        bc    = opts.get("color", _DARK_BODY)
-        glow  = opts.get("glow", _GLOW)
-        _draw_robot_full(self, cx, cy, s, tilt, arm_l, arm_r, leg_l, leg_r,
-                         eye_l, eye_r, mouth, bc, glow)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1285,12 +1093,21 @@ class RobotCanvas(tk.Canvas):
         self.scene      = "sleeping"
         self._stars     = []
         self._animating = False
+        self._r1_accent = _TEAL
+        self._r1_face   = "default"
+        self._r1_acc    = "none"
+        self._r1_acc_col= _TEAL
+        self._r2_accent = _MOON
+        self._r2_face   = "default"
+        self._r2_acc    = "none"
+        self._r2_acc_col= _MOON
 
     def start(self, scene: str = "sleeping"):
         self.scene      = scene
         self.frame      = 0
         self._animating = True
         self._init_stars()
+        self._randomise_robots()
         self._tick()
 
     def stop(self):
@@ -1411,23 +1228,41 @@ class RobotCanvas(tk.Canvas):
         else:
             self._scene_fixing(cx, cy, f)
 
-    # ── Robot primitive ────────────────────────────────────────────────────────
+    # ── Per-scene robot helpers ────────────────────────────────────────────────
 
-    def _robot(self, cx, cy, opts={}):
-        """Draw a detailed robot at (cx, cy)."""
-        tilt  = opts.get("tilt", 0)
-        arm_l = opts.get("arm_l", 0)
-        arm_r = opts.get("arm_r", 0)
-        leg_l = opts.get("leg_l", 0)
-        leg_r = opts.get("leg_r", 0)
-        eye_l = opts.get("eye_l", "●")
-        eye_r = opts.get("eye_r", "●")
-        mouth = opts.get("mouth", "—")
-        color = opts.get("color", _DARK_BODY)
-        glow  = opts.get("glow", "#00ff88")
-        scale = opts.get("scale", 1.0)
-        _draw_robot_full(self, cx, cy, scale, tilt, arm_l, arm_r, leg_l, leg_r,
-                         eye_l, eye_r, mouth, color, glow)
+    def _randomise_robots(self):
+        """Pick fresh accent, face, and accessory for both scene robots."""
+        self._r1_accent  = random.choice(ACCENT_COLORS)
+        self._r1_face    = random.choice(list(FACE_VARIANTS.keys()))
+        self._r1_acc     = random.choices(list(ACCESSORIES.keys()), weights=[5,1,1,1,1])[0]
+        self._r1_acc_col = random.choice(ACCENT_COLORS)
+        self._r2_accent  = random.choice(ACCENT_COLORS)
+        self._r2_face    = random.choice(list(FACE_VARIANTS.keys()))
+        self._r2_acc     = random.choices(list(ACCESSORIES.keys()), weights=[5,1,1,1,1])[0]
+        self._r2_acc_col = random.choice(ACCENT_COLORS)
+
+    def _draw_scene_robot(self, cx, cy_body, pixel_size, activity,
+                          accent=None, face_key=None, acc_name="none", acc_col=None):
+        """Draw one pixel-art robot and return (sprite_top_y, sprite_bottom_y).
+
+        cy_body: body-centre y using the old s=1 convention — visual ground is
+        at cy_body + 78.  pixel_size=8 for hero, pixel_size=6 for secondary.
+        """
+        cy_sprite = int(cy_body + 78 - 12 * pixel_size)
+        pal = dict(DEFAULT_PALETTE)
+        pal["G"] = accent if accent else _TEAL
+        frames     = ROBOT_SPRITES.get(activity, ROBOT_SPRITES["idle"])
+        frame_rate = ACTIVITY_FRAME_RATE.get(activity, 0.18)
+        anim_phase = self.frame * frame_rate * _PHASE
+        frame_idx  = int(anim_phase * len(frames) / (2 * math.pi)) % len(frames)
+        face_var   = None if activity == "sleep" else FACE_VARIANTS.get(face_key)
+        accessory  = ACCESSORIES.get(acc_name)
+        draw_pixel_sprite(self, frames[frame_idx], cx, cy_sprite, pixel_size,
+                          palette=pal,
+                          face=face_var, accessory=accessory, accessory_color=acc_col)
+        sprite_top    = cy_sprite - 12 * pixel_size
+        sprite_bottom = cy_sprite + 12 * pixel_size
+        return sprite_top, sprite_bottom
 
     # ── Scene: sleeping ────────────────────────────────────────────────────────
 
@@ -1450,34 +1285,35 @@ class RobotCanvas(tk.Canvas):
             sy  = my + math.sin(ang)*28
             self.create_oval(sx-sr, sy-sr, sx+sr, sy+sr, fill=_MOON, outline="")
 
-        # Robot 1 — slumped, sleeping
-        self._robot(cx-100, cy+bob, {
-            "tilt": 20, "arm_l": 18, "arm_r": 8,
-            "eye_l": "—", "eye_r": "—", "mouth": "~",
-            "leg_l": 8, "leg_r": -6,
-        })
-        # Zzz floating up
+        # Robot 1 — sleeping hero (pixel_size=8)
+        r1_cx = cx - 100
+        r1_top, r1_bot = self._draw_scene_robot(
+            r1_cx, cy + bob, 8, "sleep",
+            accent=self._r1_accent, face_key=self._r1_face,
+            acc_name=self._r1_acc, acc_col=self._r1_acc_col)
+        # Zzz floating up from robot 1's head
         zzz_phase = (f//50) % 3
         for i in range(zzz_phase+1):
-            self.create_text(cx-55+i*14, cy-30-i*14+math.sin(f*0.04*_PHASE)*3,
+            self.create_text(r1_cx + 55 + i*14,
+                           r1_top - 10 - i*14 + math.sin(f*0.04*_PHASE)*3,
                            text="z", fill=_TEAL,
                            font=("Courier New", 9+i*4, "bold"))
 
-        # Robot 2 — leaning, half-awake
-        self._robot(cx+100, cy-bob, {
-            "tilt": -18, "arm_l": -12, "arm_r": -8,
-            "eye_l": "·", "eye_r": "·", "mouth": "o",
-            "leg_l": -6, "leg_r": 6,
-        })
-        # Sparkles
+        # Robot 2 — half-awake secondary (pixel_size=6)
+        r2_cx = cx + 100
+        r2_top, _ = self._draw_scene_robot(
+            r2_cx, cy - bob, 6, "idle",
+            accent=self._r2_accent, face_key=self._r2_face,
+            acc_name=self._r2_acc, acc_col=self._r2_acc_col)
+        # Sparkles near robot 2's head
         for i in range(4):
-            sx = cx+148+i*18
-            sy = cy-54-i*8+math.sin(f*0.07*_PHASE+i)*5
+            sx = r2_cx + 48 + i*18
+            sy = r2_top + 20 - i*8 + math.sin(f*0.07*_PHASE+i)*5
             sr = max(1, 4-i)
             self.create_oval(sx-sr, sy-sr, sx+sr, sy+sr, fill=_MOON, outline="")
 
-        # Pillow under robot 1
-        self.create_oval(cx-140, cy+68, cx-60, cy+82, fill=_DIM, outline=_GLOW, width=1)
+        # Pillow under robot 1 at ground level
+        self.create_oval(cx-140, r1_bot-14, cx-60, r1_bot+4, fill=_DIM, outline=_GLOW, width=1)
 
     # ── Scene: lunch ───────────────────────────────────────────────────────────
 
@@ -1517,27 +1353,25 @@ class RobotCanvas(tk.Canvas):
             self.create_line(mug_x+5+si*7, mug_y-5+cup_steam,
                            mug_x+7+si*7, mug_y-12+cup_steam, fill="#334455", width=1)
 
-        # Robot 1 eating
-        eat = _eased_sin(f*0.18*_PHASE)*10
-        self._robot(cx-120, cy+bob, {
-            "tilt": 8, "arm_r": eat-16,
-            "eye_l": "^", "eye_r": "^", "mouth": "U",
-            "leg_l": 4, "leg_r": -4,
-        })
-        # Fork animation
-        fork_x = cx-84
-        fork_y = cy+22+eat-16+bob
+        # Robot 1 — eating hero (pixel_size=8)
+        r1_cx = cx - 120
+        r1_top, _ = self._draw_scene_robot(
+            r1_cx, cy + bob, 8, "eat",
+            accent=self._r1_accent, face_key=self._r1_face,
+            acc_name=self._r1_acc, acc_col=self._r1_acc_col)
+        # Fork held at right arm tip (col 18, row 15 of sprite)
+        fork_x = r1_cx + (18 - 10) * 8   # cx + 64 from sprite centre
+        fork_y = r1_top + 15 * 8
         self.create_line(fork_x, fork_y, fork_x, fork_y-16, fill=_GLOW, width=2)
         for tine in range(3):
             self.create_line(fork_x-3+tine*3, fork_y-16, fork_x-3+tine*3, fork_y-22,
                            fill=_GLOW, width=1)
 
-        # Robot 2 relaxing
-        self._robot(cx+130, cy-bob, {
-            "tilt": -8, "arm_l": -8, "arm_r": -18,
-            "eye_l": "●", "eye_r": "^", "mouth": ")",
-            "leg_l": -5, "leg_r": 3,
-        })
+        # Robot 2 — relaxing secondary (pixel_size=6)
+        self._draw_scene_robot(
+            cx + 130, cy - bob, 6, "idle",
+            accent=self._r2_accent, face_key=self._r2_face,
+            acc_name=self._r2_acc, acc_col=self._r2_acc_col)
 
     # ── Scene: kita_goodbye ────────────────────────────────────────────────────
 
@@ -1604,24 +1438,21 @@ class RobotCanvas(tk.Canvas):
             else:
                 self.create_rectangle(sx-cr, sy-cr//2, sx+cr, sy+cr//2, fill=col, outline="")
 
-        # Robot 1 — cheering
-        wave_l = -30 + 9*_eased_sin(f*0.20*_PHASE)
-        wave_r = -30 + 9*_eased_sin(f*0.20*_PHASE+0.4)
-        self._robot(cx-140, cy+bob, {
-            "tilt": 8, "arm_l": wave_l, "arm_r": wave_r,
-            "eye_l": "^", "eye_r": "^", "mouth": "D",
-            "leg_l": 6, "leg_r": -6, "glow": _MOON,
-        })
+        # Robot 1 — cheering hero (pixel_size=8)
+        self._draw_scene_robot(
+            cx - 140, cy + bob, 8, "cheer",
+            accent=self._r1_accent, face_key=self._r1_face,
+            acc_name=self._r1_acc, acc_col=self._r1_acc_col)
 
-        # Robot 2 — waving with lunchbox
-        wave_l2 = -30 + 9*_eased_sin(f*0.17*_PHASE+1.2)
-        self._robot(cx+140, cy-bob, {
-            "tilt": -10, "arm_l": wave_l2, "arm_r": -12,
-            "eye_l": "^", "eye_r": "^", "mouth": ")",
-            "leg_l": -5, "leg_r": 5, "glow": _TEAL,
-        })
-        lx = cx+100
-        ly = cy - bob + 12
+        # Robot 2 — waving with lunchbox (pixel_size=6)
+        r2_cx = cx + 140
+        r2_top, _ = self._draw_scene_robot(
+            r2_cx, cy - bob, 6, "wave",
+            accent=self._r2_accent, face_key=self._r2_face,
+            acc_name=self._r2_acc, acc_col=self._r2_acc_col)
+        # Lunchbox at robot 2's left arm (col 0, row 14)
+        lx = r2_cx + (0 - 10) * 6   # left arm tip x
+        ly = r2_top + 14 * 6
         self.create_rectangle(lx-13, ly-10, lx+13, ly+10,
                             fill=_DIM, outline=_TEAL, width=1)
         self.create_text(lx, ly, text="🍱", font=("", 12), anchor="center")
@@ -1662,27 +1493,36 @@ class RobotCanvas(tk.Canvas):
             self.create_text(sx+i*5, sy-i*5, text="✦",
                            fill=spark_colors[i], font=("Courier New", 7+i*2))
 
-        # Robot 1 — working with tool
-        self._robot(cx-130, cy+bob, {
-            "tilt": 12, "arm_r": -22,
-            "eye_l": "●", "eye_r": "●", "mouth": "/",
-            "leg_l": 6, "leg_r": -4,
-        })
-        # Wrench tool
-        self.create_oval(cx-88, cy-5+bob, cx-78, cy+5+bob, fill=_GLOW, outline="")
-        self.create_line(cx-83, cy+5+bob, cx-76, cy+22+bob, fill=_GLOW, width=3)
+        # Robot 1 — working hero (pixel_size=8)
+        r1_cx = cx - 130
+        r1_top, _ = self._draw_scene_robot(
+            r1_cx, cy + bob, 8, "fix",
+            accent=self._r1_accent, face_key=self._r1_face,
+            acc_name=self._r1_acc, acc_col=self._r1_acc_col)
+        # Wrench at robot 1's right arm tip (col 18, row 14)
+        wrench_x = r1_cx + (18 - 10) * 8
+        wrench_y = r1_top + 14 * 8
+        self.create_oval(wrench_x-5, wrench_y-5+bob, wrench_x+5, wrench_y+5+bob,
+                        fill=_GLOW, outline="")
+        self.create_line(wrench_x, wrench_y+5+bob, wrench_x+7, wrench_y+22+bob,
+                        fill=_GLOW, width=3)
 
-        # Robot 2 — supervising with clipboard
-        self._robot(cx+130, cy-bob, {
-            "tilt": -10, "arm_l": -28, "arm_r": 6,
-            "eye_l": "◉", "eye_r": "◉", "mouth": "!",
-            "leg_l": -5, "leg_r": 4,
-        })
-        # Clipboard
-        self.create_rectangle(cx+148, cy-22, cx+170, cy+8, fill=_DIM, outline=_GLOW, width=1)
-        self.create_rectangle(cx+150, cy-20, cx+168, cy-16, fill="#2a1a6e", outline="")
+        # Robot 2 — supervising with clipboard (pixel_size=6)
+        r2_cx = cx + 130
+        r2_top, _ = self._draw_scene_robot(
+            r2_cx, cy - bob, 6, "wave",
+            accent=self._r2_accent, face_key=self._r2_face,
+            acc_name=self._r2_acc, acc_col=self._r2_acc_col)
+        # Clipboard at robot 2's right (robot faces right, holds clipboard outward)
+        clip_x = r2_cx + 50
+        clip_y = r2_top + 15 * 6
+        self.create_rectangle(clip_x-13, clip_y-18, clip_x+13, clip_y+12,
+                            fill=_DIM, outline=_GLOW, width=1)
+        self.create_rectangle(clip_x-11, clip_y-16, clip_x+11, clip_y-12,
+                            fill="#2a1a6e", outline="")
         for row in range(3):
-            self.create_line(cx+152, cy-13+row*7, cx+166, cy-13+row*7, fill=_GLOW, width=1)
+            self.create_line(clip_x-9, clip_y-9+row*7, clip_x+9, clip_y-9+row*7,
+                           fill=_GLOW, width=1)
 
     # ── Scene: tubby ───────────────────────────────────────────────────────────
 
@@ -1733,16 +1573,16 @@ class RobotCanvas(tk.Canvas):
                         fill=water_col, outline="")
 
         # ── Robots inside the tub ─────────────────────────────────────────
-        self._robot(cx - 90, cy + bob, {
-            "tilt": 8, "arm_l": -30, "arm_r": -26,
-            "eye_l": "^", "eye_r": "^", "mouth": "D",
-            "leg_l": 0, "leg_r": 0, "glow": _TEAL,
-        })
-        self._robot(cx + 75, cy - bob, {
-            "tilt": -12, "arm_l": -16, "arm_r": 10,
-            "eye_l": "^", "eye_r": "●", "mouth": ")",
-            "leg_l": 0, "leg_r": 0, "glow": _MOON,
-        })
+        # Foam at water_y covers the lower sprite rows (legs), leaving the
+        # upper body visible — robots appear happily half-submerged.
+        self._draw_scene_robot(
+            cx - 90, cy + bob, 8, "cheer",
+            accent=self._r1_accent, face_key=self._r1_face,
+            acc_name=self._r1_acc, acc_col=self._r1_acc_col)
+        self._draw_scene_robot(
+            cx + 75, cy - bob, 6, "dance",
+            accent=self._r2_accent, face_key=self._r2_face,
+            acc_name=self._r2_acc, acc_col=self._r2_acc_col)
 
         # ── Splash drops around robot 1 ───────────────────────────────────
         splash_r = 20 + (f // 8) % 10
