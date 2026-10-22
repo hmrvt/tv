@@ -1650,3 +1650,4 @@ class RobotCanvas(tk.Canvas):
             wr  = 11 + (i % 3) * 4
             self.create_oval(wx-wr, wy-wr//2, wx+wr, wy+wr//2,
                             fill="#c8e8f8", outline="")
+

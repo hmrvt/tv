@@ -11,7 +11,7 @@ import sys
 #  OFF SCHEDULE  ← edit this!
 #
 #  Each entry: (start_hour, start_min, end_hour, end_min, scene)
-#  scene options: "sleeping" | "lunch" | "fixing" | "kita_goodbye"
+#  scene options: "sleeping" | "lunch" | "fixing" | "kita_goodbye" | "tubby"
 # ─────────────────────────────────────────────
 OFF_PERIODS = [
     (11, 0,  12, 30,  "lunch"),
@@ -23,10 +23,11 @@ OFF_PERIODS = [
 #  SCENE LABELS (shown on the off-screen animation)
 # ─────────────────────────────────────────────
 SCENES = {
-    "sleeping":      {"label": "ROBOTS SLEEPING",    "msg": "TV is resting...",    "sub": "come back later!"},
-    "lunch":         {"label": "LUNCH BREAK",         "msg": "Taking a break!",     "sub": "back soon..."},
-    "fixing":        {"label": "ENGINEERS AT WORK",   "msg": "Fixing things up!",   "sub": "almost ready..."},
-    "kita_goodbye":  {"label": "HAVE FUN AT KITA! 🎒", "msg": "See you later!",     "sub": "learning & playing..."},
+    "sleeping":      {"label": "ROBOTS SLEEPING",      "msg": "TV is resting...",    "sub": "come back later!"},
+    "lunch":         {"label": "LUNCH BREAK",           "msg": "Taking a break!",     "sub": "back soon..."},
+    "fixing":        {"label": "ENGINEERS AT WORK",     "msg": "Fixing things up!",   "sub": "almost ready..."},
+    "kita_goodbye":  {"label": "HAVE FUN AT KITA! \U0001f392", "msg": "See you later!", "sub": "learning & playing..."},
+    "tubby":         {"label": "TUBBY TIME! \U0001f6c1",        "msg": "Bubble bath!",   "sub": "splish splash..."},
 }
 
 # ─────────────────────────────────────────────
@@ -61,7 +62,10 @@ CHANNELS = [
 
 if os.path.exists("channels.json"):
     with open("channels.json", encoding="utf-8") as f:
-        CHANNELS = json.load(f)
+        _loaded = json.load(f)
+    # Version 2 (library.py's catalog) wraps the list; version 1 is a bare list.
+    # Only name / emoji / color are read from here — library.py owns the rest.
+    CHANNELS = _loaded["channels"] if isinstance(_loaded, dict) else _loaded
 
 N = len(CHANNELS)
 

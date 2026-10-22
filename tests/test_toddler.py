@@ -77,8 +77,9 @@ class ToddlerTestCase(unittest.TestCase):
             patch.object(_tt.ToddlerTV, "_attach_vlc_to_window"),
             patch.object(_tt.ToddlerTV, "_show_robots"),
             patch.object(_tt.ToddlerTV, "_hide_robots"),
-            patch.object(_tt.ToddlerTV, "_start_mini_robots"),
-            patch.object(_tt.ToddlerTV, "_stop_mini_robots"),
+            # _start/_stop_mini_robots are gone: the bottom panel now shows
+            # the scene banner.  _hide/_show_channel_buttons stay unpatched so
+            # they keep real coverage; setUp stubs the widgets they touch.
             patch.object(_tt.ToddlerTV, "_update_buttons"),
             patch.object(_tt.ToddlerTV, "_update_clock"),
             patch.object(_tt.ToddlerTV, "_resolve_channel"),
@@ -99,6 +100,9 @@ class ToddlerTestCase(unittest.TestCase):
         self.app.bottom_panel       = MagicMock()
         self.app.clock_label        = MagicMock()
         self.app.static_canvas      = MagicMock()
+        # Bottom-panel widgets hidden/restored around an off period
+        self.app.panel_header       = MagicMock()
+        self.app.buttons_frame      = MagicMock()
 
         # Give every channel a resolved, ready state so button presses aren't
         # blocked by "still loading" guards.

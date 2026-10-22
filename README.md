@@ -49,7 +49,9 @@ pip install -r requirements.txt
 
 **3. Configure your channels**
 
-Copy the example below into a file called `channels.json` in the project root. Each channel needs a `name`, an `emoji`, a `color`, and either a `playlist` (individual video URLs) or a `playlist_url` (a YouTube playlist URL that gets expanded automatically).
+Copy the example below into a file called `channels.json` in the project root to get started. Each channel needs a `name`, an `emoji`, a `color`, and either a `playlist` (individual video URLs) or a `playlist_url` (a YouTube playlist URL).
+
+On first start the app converts this file into its own catalog format (the original is kept as `channels.json.v1.bak`). From then on the app owns the playlists: manage videos, YouTube source playlists, channel names and colours from the phone remote rather than by editing the file.
 
 ```json
 [
@@ -123,7 +125,21 @@ Each entry is `(start_hour, start_min, end_hour, end_min, scene)`.
 
 ## Phone remote
 
-Open `http://<your-pc-ip>:8080` from any device on the same Wi-Fi. The interface shows the current off-period schedule and lets you add, edit, or delete entries. Changes take effect within 30 seconds.
+Open `http://<your-pc-ip>:8080` from any device on the same Wi-Fi. The landing page shows the off-period schedule and lets you add, edit, or delete entries; changes take effect within 30 seconds. Tap a channel card to manage what that channel is playing.
+
+**Per-channel pages** — each channel has five tabs:
+
+| Tab | What you can do |
+|---|---|
+| **Now playing** (`/ch/<n>`) | **Skip** the current video; **Skip** an upcoming one for this round only; **Remove** a video (moves it to Ignored and deletes its download); **Add to this channel** (plays next, downloads, stays for good); **Play once, then forget** (never downloaded or saved). |
+| **Videos** (`/ch/<n>/videos`) | Every video on the channel, where it came from, and whether it is downloaded. **Remove** moves it to Ignored. |
+| **Ignored** (`/ch/<n>/ignored`) | Videos you removed. **Restore** puts one back, plays it next and downloads it again. |
+| **YouTube playlists** (`/ch/<n>/sources`) | The playlists that feed the channel. **Add playlist** pulls its videos in straight away; **Stop using this playlist** keeps its videos but stops checking it; **Check YouTube playlists for new videos** syncs now instead of waiting. |
+| **Settings** (`/ch/<n>/settings`) | Rename the channel, change its emoji and colour, or **merge** it into another channel (everything moves across; this channel is left empty, ready to reuse). |
+
+Rows are tagged `SAVED` downloaded, `GETTING` downloading, `STREAM` plays from YouTube, `ONCE` a one-shot injection.
+
+> **How YouTube playlists are used:** the app owns each channel's playlist, stored in `channels.json`. Every 30 minutes (and 90 s after start-up) it checks each channel's YouTube playlists and adds any new videos, apart from ones you have ignored. Taking a video out of a playlist on YouTube does **not** remove it from the TV — only the remote does that. The app never writes to YouTube.
 
 The PC's IP address is printed to the console on startup:
 
@@ -184,12 +200,32 @@ python -m unittest discover tests/ -v
 
 ---
 
+## Keeping playlists up to date
+
+The app re-reads every channel's YouTube playlist every 30 minutes while it runs (`ToddlerTV.PLAYLIST_REFRESH_MINS`), so a restart is no longer needed to pick up changes.
+
+- **Videos added to the playlist** are queued to play right after whatever is on screen, shuffled so they don't arrive in upload order, and downloaded ahead of everything else in the queue.
+- **Videos removed from the playlist** drop out of the rotation, and their downloaded file is deleted.
+- **Missing downloads** are filled in by a background worker, one at a time, pausing while a channel is buffering a stream. Running `downloader.py` by hand is now optional — it is still there for a bulk first fetch before the app starts.
+- **A failed playlist fetch changes nothing.** If yt-dlp returns an empty list, the feed is left alone and no files are deleted, so a network blip can't wipe the local library.
+
+Local files live in `videos/`, named `<video-id>.mp4`. Files no longer referenced by any channel are swept after a successful sync of every channel.
+
+---
+
 ## Troubleshooting
 
 **Black screen / no video**
 - Confirm VLC is installed at the default path (`C:\Program Files\VideoLAN\VLC` on Windows).
 - Run `python -m yt_dlp <url>` to test if yt-dlp can access the video.
 - Try exporting fresh cookies with `--cookies-from-browser`.
+
+**A new video in the playlist hasn't appeared**
+- The automatic sync runs every 30 minutes; tap **⟳ Sync Playlist Now** on the channel page to force it.
+- Check the console for `[CH1] refresh: empty playlist response` — that means the fetch failed and the feed was deliberately left untouched.
+
+**A downloaded file didn't get deleted**
+- Windows won't delete a file VLC still has open. The next sweep picks it up.
 
 **"Rate-limited" messages in the console**
 - Normal for large playlists. The app automatically waits and retries.

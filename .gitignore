@@ -16,7 +16,10 @@ env/
 # App data (user-specific or sensitive)
 cookies.txt
 channels.json
+channels.json.*
 schedule.json
+playlist_overlay.json
+playlist_overlay.json.*
 videos/
 
 # Local ffmpeg installation

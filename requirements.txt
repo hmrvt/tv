@@ -13,3 +13,5 @@
 python-vlc==3.0.21203
 yt-dlp==2026.3.17
 Pillow==12.1.0
+qrcode==8.2
+colorama==0.4.6

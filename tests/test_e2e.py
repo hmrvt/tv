@@ -123,9 +123,9 @@ class TestScheduleLifecycle(unittest.TestCase):
 
     def test_multiple_scenes_persist(self):
         periods = [
-            (7,  0,  8,  0, "sleeping"),
-            (12, 0, 13,  0, "lunch"),
-            (19, 30, 23, 59, "sleeping"),
+            (7,  0,  8,  0, "sleeping", [], False),
+            (12, 0, 13,  0, "lunch",    [], False),
+            (19, 30, 23, 59, "sleeping", [], False),
         ]
         save_periods(periods)
         loaded = get_periods()
@@ -178,19 +178,9 @@ class TestWebRemoteServer(unittest.TestCase):
 
     # ── HTTP helpers ──────────────────────────────────────────────────────────
 
-    @classmethod
-    def _auth_header(cls) -> str:
-        """Base64-encoded Basic Auth credential for the current boot password."""
-        import base64
-        import web_remote as _wr
-        return "Basic " + base64.b64encode(
-            f"admin:{_wr._BOOT_PASSWORD}".encode()
-        ).decode()
-
     def _get(self):
-        import web_remote as _wr
         conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
-        conn.request("GET", "/", headers={"Authorization": self._auth_header()})
+        conn.request("GET", "/")
         resp = conn.getresponse()
         body = resp.read().decode("utf-8")
         conn.close()
@@ -206,7 +196,6 @@ class TestWebRemoteServer(unittest.TestCase):
         conn.request("POST", "/", data, {
             "Content-Type":   "application/x-www-form-urlencoded",
             "Content-Length": str(len(data)),
-            "Authorization":  self._auth_header(),
         })
         resp = conn.getresponse()
         html = resp.read().decode("utf-8")
@@ -292,22 +281,28 @@ class TestChannelResolutionWorkflow(unittest.TestCase):
 
     def _add(self, state: ChannelState, info: dict, yt_url: str):
         """Replicate ToddlerTV._add_video without any UI calls."""
+        pl_idx = len(state.videos)
+        # Ensure playlist_urls has an entry for this position
+        if pl_idx >= len(state._playlist_urls):
+            state._playlist_urls.append(yt_url)
+            state._play_queue.append(pl_idx)
+        video_list_idx = len(state.videos)
         state.videos.append({
-            "yt_url":       yt_url,
-            "stream_url":   info["url"],
-            "duration":     info["duration"],
-            "title":        info.get("title", ""),
-            "channel":      info.get("channel", ""),
-            "channel_id":   info.get("channel_id", ""),
-            "thumbnail":    info.get("thumbnail", ""),
-            "_resolved_at": time.time(),
+            "yt_url":          yt_url,
+            "stream_url":      info["url"],
+            "duration":        info["duration"],
+            "title":           info.get("title", ""),
+            "channel":         info.get("channel", ""),
+            "channel_id":      info.get("channel_id", ""),
+            "thumbnail":       info.get("thumbnail", ""),
+            "_resolved_at":    time.time(),
+            "_playlist_idx":   pl_idx,
         })
+        state._resolved_map[pl_idx] = video_list_idx
         if not state.ready:
             state.ready = True
         if not state._initialized:
             state.advance_video(0.0)
-        else:
-            state.queue_new_video(len(state.videos) - 1)
 
     def test_single_video_ready_after_resolve(self):
         state = ChannelState()
@@ -366,16 +361,15 @@ class TestChannelResolutionWorkflow(unittest.TestCase):
         self._add(state, _FAKE_INFO, "url0")
         self.assertEqual(state.videos[0]["channel_id"], "UC_test123")
 
-    def test_pending_url_queue_drains(self):
-        """Simulate resolving 2 of 3 URLs upfront; 1 left as pending."""
-        urls  = [f"https://www.youtube.com/watch?v=v{i}" for i in range(3)]
+    def test_play_queue_contains_all_playlist_positions(self):
+        """After adding videos the play queue accounts for all playlist positions."""
+        urls = [f"https://www.youtube.com/watch?v=v{i}" for i in range(3)]
         state = ChannelState()
-        for url in urls[:2]:           # INITIAL_RESOLVE = 2
+        for url in urls:
             self._add(state, _FAKE_INFO, url)
-        state.pending_urls = urls[2:]
 
-        self.assertEqual(len(state.videos), 2)
-        self.assertEqual(len(state.pending_urls), 1)
+        all_positions = {state._current_playlist_idx} | set(state._play_queue)
+        self.assertEqual(all_positions, {0, 1, 2})
         self.assertTrue(state.ready)
 
 
@@ -419,8 +413,9 @@ class TestAppStateMachine(unittest.TestCase):
             patch.object(self._tt.ToddlerTV, "_attach_vlc_to_window"),
             patch.object(self._tt.ToddlerTV, "_show_robots"),
             patch.object(self._tt.ToddlerTV, "_hide_robots"),
-            patch.object(self._tt.ToddlerTV, "_start_mini_robots"),
-            patch.object(self._tt.ToddlerTV, "_stop_mini_robots"),
+            # _start/_stop_mini_robots are gone: the bottom panel now shows the
+            # scene banner.  _hide/_show_channel_buttons are left unpatched so
+            # they keep real coverage; setUp stubs the widgets they touch.
             patch.object(self._tt.ToddlerTV, "_update_buttons"),
             patch.object(self._tt.ToddlerTV, "_update_clock"),
             patch.object(self._tt.ToddlerTV, "_resolve_channel"),
@@ -442,6 +437,9 @@ class TestAppStateMachine(unittest.TestCase):
         self.app.bottom_panel       = MagicMock()
         self.app.clock_label        = MagicMock()
         self.app.static_canvas      = MagicMock()
+        # Bottom-panel widgets hidden/restored around an off period
+        self.app.panel_header       = MagicMock()
+        self.app.buttons_frame      = MagicMock()
 
     def tearDown(self):
         # Brief wait so any daemon threads finish their current work before the
@@ -639,6 +637,190 @@ class TestAppStateMachine(unittest.TestCase):
         args = mock_play.call_args[0]
         self.assertEqual(args[0], "C:/videos/abc.mp4")
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Channel catalog — the app owns the playlist (library.py + web callbacks)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_VA, _VB, _VC, _VD = "aaaaaaaaaaa", "bbbbbbbbbbb", "ccccccccccc", "ddddddddddd"
+_PLA = "PLaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+_PLB = "PLbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+
+def _watch(vid):
+    return f"https://www.youtube.com/watch?v={vid}"
+
+
+class TestCatalogFlow(unittest.TestCase):
+    """Drive the web-remote callbacks against a real catalog file."""
+
+    @classmethod
+    def setUpClass(cls):
+        import toddlertv as _tt
+        cls._tt = _tt
+
+    def setUp(self):
+        import library as _library
+        self._library = _library
+        self._tmp = tempfile.mkdtemp()
+        self._lib_patches = [
+            patch.object(_library, "CATALOG_FILE",
+                         os.path.join(self._tmp, "channels.json")),
+            patch("toddlertv.downloads.manager.enqueue_many", return_value=0),
+            patch("toddlertv.delete_local_file", return_value=True),
+            patch("toddlertv.find_local_file", return_value=None),
+            patch("toddlertv.get_video_info", return_value=None),
+        ]
+        for p in self._lib_patches:
+            p.start()
+        _library.save_catalog([
+            {"name": "Cartoons", "emoji": "C", "color": "#FF6B6B",
+             "sources": [{"playlist_id": _PLA, "title": "A"}],
+             "videos": [{"id": _VA, "origin": _PLA}, {"id": _VB, "origin": _PLA}],
+             "ignored": []},
+            {"name": "Songs", "emoji": "S", "color": "#4ECDC4",
+             "sources": [], "videos": [{"id": _VC, "origin": "manual"}], "ignored": []},
+            {"name": "Learning", "emoji": "L", "color": "#FFD93D",
+             "sources": [{"playlist_id": _PLB, "title": "B"}],
+             "videos": [{"id": _VD, "origin": _PLB}, {"id": _VA, "origin": "manual"}],
+             "ignored": [{"id": _VC, "origin": _PLB}]},
+        ])
+        TestAppStateMachine.setUp(self)
+        # Load each channel's feed from the catalog the way start-up does.
+        for i, state in enumerate(self.app.states):
+            state.set_playlist([_watch(v) for v in _library.video_ids(i)])
+            state._play_queue = state.active_positions()
+
+    def tearDown(self):
+        TestAppStateMachine.tearDown(self)
+        for p in self._lib_patches:
+            p.stop()
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _active_urls(self, ch):
+        st = self.app.states[ch]
+        return {st.url_at(p) for p in st.active_positions()}
+
+    # ── Remove → Ignored → Restore ────────────
+
+    def test_remove_moves_the_video_to_ignored(self):
+        self.assertTrue(self.app._web_remove_video(0, 1, True))
+        ch = self._library.get_channel(0)
+        self.assertEqual([v["id"] for v in ch["ignored"]], [_VB])
+        self.assertNotIn(_watch(_VB), self._active_urls(0))
+
+    def test_round_skip_does_not_touch_the_catalog(self):
+        self.app._web_remove_video(0, 1, False)
+        self.assertEqual(self._library.video_ids(0), [_VA, _VB])
+
+    def test_ignore_from_the_videos_page(self):
+        self.assertTrue(self.app._web_ignore_video(0, _watch(_VB)))
+        self.assertNotIn(_VB, self._library.video_ids(0))
+        self.assertNotIn(_watch(_VB), self._active_urls(0))
+
+    def test_ignoring_a_shared_video_keeps_its_file(self):
+        """_VA is also on Learning, so its download must survive."""
+        with patch("toddlertv.delete_local_file") as delete:
+            self.app._web_ignore_video(0, _watch(_VA))
+        delete.assert_not_called()
+
+    def test_ignoring_an_unshared_video_deletes_its_file(self):
+        with patch("toddlertv.delete_local_file", return_value=False) as delete:
+            self.app._web_ignore_video(0, _watch(_VB))
+        delete.assert_called_once_with(_VB)
+
+    def test_restore_brings_it_back_and_plays_it_next(self):
+        self.app._web_ignore_video(0, _watch(_VB))
+        self.assertTrue(self.app._web_restore_video(0, _watch(_VB)))
+        self.assertIn(_VB, self._library.video_ids(0))
+        st = self.app.states[0]
+        self.assertEqual(st.url_at(st._play_queue[0]), _watch(_VB))
+
+    # ── Source sync only adds ─────────────────
+
+    def test_sync_adds_new_videos_and_plays_them_next(self):
+        with patch.object(self._library, "fetch_source_ids", return_value=[_VA, _VD]):
+            added, ok = self.app._refresh_channel(0)
+        self.assertEqual((added, ok), (1, True))
+        self.assertEqual(self._library.video_ids(0), [_VA, _VB, _VD])
+        st = self.app.states[0]
+        self.assertEqual(st.url_at(st._play_queue[0]), _watch(_VD))
+
+    def test_sync_keeps_a_video_taken_off_youtube(self):
+        with patch.object(self._library, "fetch_source_ids", return_value=[_VA]):
+            self.app._refresh_channel(0)
+        self.assertIn(_watch(_VB), self._active_urls(0))
+
+    def test_sync_does_not_bring_back_an_ignored_video(self):
+        self.app._web_ignore_video(0, _watch(_VB))
+        with patch.object(self._library, "fetch_source_ids", return_value=[_VA, _VB]):
+            added, _ = self.app._refresh_channel(0)
+        self.assertEqual(added, 0)
+        self.assertNotIn(_watch(_VB), self._active_urls(0))
+
+    def test_failed_fetch_changes_nothing(self):
+        with patch.object(self._library, "fetch_source_ids", return_value=[]):
+            added, ok = self.app._refresh_channel(0)
+        self.assertEqual((added, ok), (0, False))
+        self.assertEqual(self._library.video_ids(0), [_VA, _VB])
+
+    # ── Merge ─────────────────────────────────
+
+    def test_merge_moves_learning_into_cartoons(self):
+        self.assertTrue(self.app._web_merge_channel(2, 0))
+        self.assertEqual(self._library.video_ids(0), [_VA, _VB, _VD])
+        self.assertEqual(self._library.video_ids(2), [])
+        self.assertIn(_watch(_VD), self._active_urls(0))
+        self.assertEqual(self.app.states[2].active_positions(), [])
+        sources = [s["playlist_id"] for s in self._library.get_channel(0)["sources"]]
+        self.assertEqual(sources, [_PLA, _PLB])
+
+    def test_merge_does_not_delete_downloads(self):
+        with patch("toddlertv.delete_local_file") as delete:
+            self.app._web_merge_channel(2, 0)
+        delete.assert_not_called()
+
+    def test_merge_into_itself_is_refused(self):
+        self.assertFalse(self.app._web_merge_channel(0, 0))
+
+    def test_emptied_channel_starts_once_a_playlist_fills_it(self):
+        """The repurposed slot rebuilds its feed from the catalog on first sync."""
+        self.app._web_merge_channel(2, 0)
+        self._library.add_source(2, _PLB)
+        with patch.object(self._library, "fetch_source_ids", return_value=[_VC, _VD]), \
+             patch.object(self.app, "_resolve_channel") as resolve:
+            added, _ = self.app._refresh_channel(2)
+            time.sleep(0.1)    # the reload runs on a worker thread
+        # The ignored list moved to Cartoons with everything else, so the
+        # emptied slot ignores nothing.
+        self.assertEqual(added, 2)
+        resolve.assert_called_once_with(2)
+
+    # ── Settings ──────────────────────────────
+
+    def test_save_channel_updates_the_live_button_data(self):
+        with patch.dict(self._tt.CHANNELS[2], {}):
+            self.assertTrue(self.app._web_save_channel(
+                2, "Planes, Trains & Automobiles", "\U0001f682", "#4D96FF"))
+            self.assertEqual(self._tt.CHANNELS[2]["name"], "Planes, Trains & Automobiles")
+        self.assertEqual(self._library.get_channel(2)["color"], "#4D96FF")
+
+    # ── Prune ─────────────────────────────────
+
+    def test_prune_keeps_every_catalog_video(self):
+        with patch("toddlertv.list_local_video_ids",
+                   return_value={_VA, _VB, _VC, _VD, "zzzzzzzzzzz"}), \
+             patch("toddlertv.delete_local_file", return_value=True) as delete:
+            self.app._prune_orphan_downloads()
+        delete.assert_called_once_with("zzzzzzzzzzz")
+
+    def test_prune_refuses_an_empty_catalog(self):
+        self._library.save_catalog([])
+        with patch("toddlertv.list_local_video_ids", return_value={_VA}), \
+             patch("toddlertv.delete_local_file") as delete:
+            self.assertEqual(self.app._prune_orphan_downloads(), 0)
+        delete.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -147,6 +147,19 @@ subprocess.run(f"yt-dlp {url}", shell=True)
 subprocess.run([sys.executable, "-m", "yt_dlp", ..., url], shell=False)
 ```
 
+**Pass `--` before any positional URL, and rebuild the URL from a validated ID.**
+
+```python
+# REQUIRED for new subprocess calls — blocks option injection (finding N1)
+video_id = _validate_video_id(raw_id)
+url = f"https://www.youtube.com/watch?v={video_id}"
+subprocess.run([..., "--", url], shell=False)
+```
+
+`downloads.py` follows this pattern, and `ffprobe_duration()` uses ffprobe's
+`-i` for the same reason (YouTube IDs routinely start with `-`).  The calls in
+`media.py` still take the URL directly — that is deferred finding N1.
+
 **Never add undocumented yt-dlp flags.**
 The flags `--js-runtimes` and `--remote-components` were removed in this audit
 because they are not in the stable yt-dlp CLI and risked fetching remote code.
@@ -186,8 +199,8 @@ Upgrade checklist:
 
 ### 5. Secrets & Sensitive Files
 
-**`cookies.txt`, `channels.json`, `schedule.json`, and `videos/` are in `.gitignore`.
-Never force-add them.**
+**`cookies.txt`, `channels.json` (and its `.bak` copies), `schedule.json`, and
+`videos/` are in `.gitignore`.  Never force-add them.**
 
 ```bash
 # FORBIDDEN
@@ -208,8 +221,8 @@ These test files must stay green before every merge:
 
 | File | What it guards |
 |------|----------------|
-| `tests/test_security_web_remote.py` | Auth, CSRF, DoS caps, scene whitelist, time parsing, logging, security headers, log injection |
-| `tests/test_security_media.py` | Video ID allowlist, path boundary, removed yt-dlp flags |
+| `tests/test_security_web_remote.py` | Auth, CSRF, DoS caps (body/count/position), scene + action whitelist, pasted-URL whitelist, time parsing, logging, security headers, log injection, feed-page escaping, channel library pages (ignore/restore/sources/settings/merge) |
+| `tests/test_security_media.py` | Video ID allowlist, path boundary (read **and delete**), removed yt-dlp flags, `validate_youtube_url` / `validate_youtube_playlist_url` host whitelist, `downloads.py` and playlist-fetch argv hygiene |
 | `tests/test_security_dependencies.py` | All packages pinned with `==`, installed versions match pins |
 
 Run the full suite:
@@ -219,6 +232,48 @@ python -m unittest discover tests/ -v
 
 Adding a new HTTP endpoint, file path operation, or subprocess call requires
 a corresponding test in the relevant security test file before the PR is merged.
+
+---
+
+### 6a. Channel Catalog & Local Library
+
+**The app owns the playlists.**  `library.py` keeps each channel's videos,
+ignored videos and YouTube source playlists in `channels.json` (version 2).
+A source sync only ever *adds*: a video taken off YouTube stays on the
+channel, and a video in `ignored` is never re-added.  Only the web remote
+removes videos (it moves them to `ignored`).
+
+**Any URL that arrives from outside the app must go through `validate_youtube_url()`.**
+Playlist links go through `validate_youtube_playlist_url()`, which returns only
+the playlist ID; rebuild the URL with `playlist_url()`.
+
+`clean_url()` is deliberately permissive — it will read `passwd` out of
+`file:///etc/passwd` and hand back a plausible watch URL.  It is fine for URLs
+that are already known-good (a catalog entry, a yt-dlp playlist expansion).
+It is *not* enough for a web-remote form field.  `library.py` re-validates every
+ID in `channels.json` on load because the file is hand-editable.
+
+```python
+# REQUIRED at every external entry point (CWE-20)
+cleaned = validate_youtube_url(raw)   # host whitelist + video-ID allowlist
+if cleaned is None:
+    ...reject...
+```
+
+**A video injected from the web remote ("Play Once") must never be persisted
+or downloaded.**  Injections are tracked in `ChannelState._injected_positions`,
+excluded from `active_positions()` / `feed_video_ids()`, and never written to
+the catalog.
+
+**Never delete a local file on the strength of a network fetch.**
+`_prune_orphan_downloads` keeps everything in the catalog (`library.all_video_ids()`)
+and refuses to run if the catalog is empty; `_discard_local_copy` keeps a file
+that another channel still lists.  An empty playlist fetch changes nothing.
+
+**Positions are permanent handles.**  `ChannelState._playlist_urls` is
+append-only; a video that leaves the channel is marked in `_removed_positions`
+rather than spliced out, so the indices already held by `_play_queue`,
+`_resolved_map` and `_failed_positions` stay valid.
 
 ---
 
