@@ -402,13 +402,190 @@ class TestScheduleQueries(unittest.TestCase):
         # schedule.json never interferes with the injected cache.
         self._patcher = patch.object(_schedule_module, "SCHEDULE_FILE", "/nonexistent/sched_test.json")
         self._patcher.start()
+        # Same for a manual status left switched on in the real project dir.
+        self._tmp = tempfile.mkdtemp()
+        self._status_patcher = patch.object(
+            _schedule_module, "STATUS_FILE", os.path.join(self._tmp, "manual_status.json"))
+        self._status_patcher.start()
+        _schedule_module._cached_status, _schedule_module._cached_status_mtime = None, 0.0
         _schedule_module._cached_periods = list(self._PERIODS)
         _schedule_module._cached_mtime = 1.0
 
     def tearDown(self):
         self._patcher.stop()
+        self._status_patcher.stop()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+        _schedule_module._cached_status, _schedule_module._cached_status_mtime = None, 0.0
         _schedule_module._cached_periods = None
         _schedule_module._cached_mtime = 0.0
+
+    # ── Manual status (overrides the schedule) ─
+
+    def test_manual_status_turns_the_tv_off_outside_any_period(self):
+        with patch("schedule.datetime") as m:
+            m.now.return_value = self._mock_now(10, 0)
+            self.assertTrue(_schedule_module.set_manual_status("tubby"))
+            self.assertTrue(is_tv_off())
+            self.assertEqual(current_scene_name(), "tubby")
+
+    def test_manual_status_overrides_a_scheduled_period(self):
+        with patch("schedule.datetime") as m:
+            m.now.return_value = self._mock_now(12, 30)    # lunch
+            _schedule_module.set_manual_status("tubby")
+            self.assertEqual(current_scene_name(), "tubby")
+
+    def test_clearing_the_status_hands_back_to_the_schedule(self):
+        with patch("schedule.datetime") as m:
+            m.now.return_value = self._mock_now(12, 30)
+            _schedule_module.set_manual_status("tubby")
+            _schedule_module.clear_manual_status()
+            self.assertEqual(current_scene_name(), "lunch")
+            m.now.return_value = self._mock_now(10, 0)
+            self.assertFalse(is_tv_off())
+
+    def test_manual_status_has_no_end_time(self):
+        with patch("schedule.datetime") as m:
+            m.now.return_value = self._mock_now(10, 0)
+            _schedule_module.set_manual_status("tubby")
+            self.assertEqual(next_on_time(), "soon")
+            self.assertEqual(_schedule_module.back_text(), "back soon")
+
+    def test_back_text_during_a_period(self):
+        with patch("schedule.datetime") as m:
+            m.now.return_value = self._mock_now(12, 30)
+            self.assertEqual(_schedule_module.back_text(), "back at 13:00")
+
+    def test_manual_status_records_when_it_started(self):
+        with patch("schedule.datetime") as m:
+            m.now.return_value = self._mock_now(18, 5)
+            _schedule_module.set_manual_status("tubby")
+        self.assertEqual(_schedule_module.get_manual_status(),
+                         {"scene": "tubby", "since": "18:05"})
+
+    def test_unknown_scene_is_refused(self):
+        self.assertFalse(_schedule_module.set_manual_status("party"))
+        self.assertIsNone(_schedule_module.get_manual_status())
+
+    def test_status_survives_a_restart(self):
+        _schedule_module.set_manual_status("tubby")
+        _schedule_module._cached_status, _schedule_module._cached_status_mtime = None, 0.0
+        self.assertEqual(_schedule_module.get_manual_status()["scene"], "tubby")
+
+    def test_hand_edited_unknown_scene_is_ignored(self):
+        with open(_schedule_module.STATUS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"scene": "<script>"}, f)
+        self.assertIsNone(_schedule_module.get_manual_status())
+
+    def test_corrupt_status_file_is_ignored(self):
+        with open(_schedule_module.STATUS_FILE, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        self.assertIsNone(_schedule_module.get_manual_status())
+
+    def test_clearing_when_nothing_is_on_is_harmless(self):
+        _schedule_module.clear_manual_status()
+        self.assertIsNone(_schedule_module.get_manual_status())
+
+    # ── Helpers for the remote's Now / Schedule pages ─
+
+    def test_current_period_reports_its_start(self):
+        with patch("schedule.datetime") as m:
+            m.now.return_value = self._mock_now(12, 30)
+            p = _schedule_module.current_off_period()
+        self.assertEqual((p["start_h"], p["start_m"], p["end_h"], p["end_m"]), (12, 0, 13, 0))
+
+    def test_next_off_period_later_today(self):
+        with patch("schedule.datetime") as m:
+            m.now.return_value = self._mock_now(10, 0)
+            nxt = _schedule_module.next_off_period()
+        self.assertEqual((nxt["start_h"], nxt["scene"]), (12, "lunch"))
+
+    def test_next_off_period_none_after_the_last(self):
+        with patch("schedule.datetime") as m:
+            m.now.return_value = self._mock_now(14, 0)
+            self.assertIsNone(_schedule_module.next_off_period())
+
+    def test_next_off_period_none_while_paused(self):
+        _schedule_module.pause_schedules()
+        with patch("schedule.datetime") as m:
+            m.now.return_value = self._mock_now(10, 0)
+            self.assertIsNone(_schedule_module.next_off_period())
+
+    def test_todays_periods_skips_paused_and_other_days(self):
+        _schedule_module._cached_periods = [
+            (7, 0, 8, 0, "sleeping", [], False),
+            (9, 0, 10, 0, "lunch", [], True),          # paused
+            (11, 0, 12, 0, "lunch", [6], False),       # Sundays only
+        ]
+        monday = datetime(2024, 1, 1, 6, 0)
+        self.assertEqual(_schedule_module.todays_periods(monday), [(420, 480, "sleeping")])
+
+    # ── Pause schedules ───────────────────────
+
+    def test_pause_keeps_the_tv_on_during_a_period(self):
+        with patch("schedule.datetime") as m:
+            m.now.return_value = self._mock_now(12, 30)    # lunch
+            _schedule_module.pause_schedules()
+            self.assertFalse(is_tv_off())
+
+    def test_resume_brings_the_period_back(self):
+        with patch("schedule.datetime") as m:
+            m.now.return_value = self._mock_now(12, 30)
+            _schedule_module.pause_schedules()
+            _schedule_module.resume_schedules()
+            self.assertEqual(current_scene_name(), "lunch")
+
+    def test_pause_does_not_touch_the_periods(self):
+        """Resuming restores exactly the enabled set; paused periods stay paused."""
+        periods = [(7, 0, 8, 0, "sleeping", [], False),
+                   (12, 0, 13, 0, "lunch", [], True)]
+        _schedule_module._cached_periods = list(periods)
+        _schedule_module.pause_schedules()
+        _schedule_module.resume_schedules()
+        self.assertEqual(_schedule_module.get_periods(), periods)
+        with patch("schedule.datetime") as m:
+            m.now.return_value = self._mock_now(12, 30)    # lunch is paused
+            self.assertFalse(is_tv_off())
+            m.now.return_value = self._mock_now(7, 30)     # sleeping is enabled
+            self.assertTrue(is_tv_off())
+
+    def test_manual_status_still_wins_while_paused(self):
+        with patch("schedule.datetime") as m:
+            m.now.return_value = self._mock_now(10, 0)
+            _schedule_module.pause_schedules()
+            _schedule_module.set_manual_status("tubby")
+            self.assertEqual(current_scene_name(), "tubby")
+            _schedule_module.clear_manual_status()
+            self.assertFalse(is_tv_off())
+
+    def test_pause_and_status_are_independent(self):
+        _schedule_module.set_manual_status("tubby")
+        _schedule_module.pause_schedules()
+        _schedule_module.clear_manual_status()
+        self.assertIsNotNone(_schedule_module.get_schedule_pause())
+        _schedule_module.set_manual_status("tubby")
+        _schedule_module.resume_schedules()
+        self.assertEqual(_schedule_module.get_manual_status()["scene"], "tubby")
+
+    def test_pause_records_when_it_started(self):
+        with patch("schedule.datetime") as m:
+            m.now.return_value = self._mock_now(9, 15)
+            _schedule_module.pause_schedules()
+        self.assertEqual(_schedule_module.get_schedule_pause(), {"since": "09:15"})
+
+    def test_pause_survives_a_restart(self):
+        _schedule_module.pause_schedules()
+        _schedule_module._cached_status, _schedule_module._cached_status_mtime = None, 0.0
+        self.assertIsNotNone(_schedule_module.get_schedule_pause())
+
+    def test_override_file_is_removed_once_nothing_is_overridden(self):
+        _schedule_module.pause_schedules()
+        _schedule_module.resume_schedules()
+        self.assertFalse(os.path.exists(_schedule_module.STATUS_FILE))
+
+    def test_only_a_literal_true_pauses(self):
+        with open(_schedule_module.STATUS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"schedules_paused": "yes"}, f)
+        self.assertIsNone(_schedule_module.get_schedule_pause())
 
     def _mock_now(self, hour, minute):
         return datetime(2024, 1, 1, hour, minute, 0)

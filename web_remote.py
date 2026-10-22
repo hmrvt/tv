@@ -1,8 +1,18 @@
 """
 Toddler TV - Web Remote
-A tiny HTTP server for controlling the off-period schedule and channel playlists
-from your phone.  Runs on port 8080 by default.
+A tiny HTTP server for controlling the TV from your phone.  Runs on port 8080.
 Open http://<media-pc-ip>:8080 from any device on the same WiFi.
+
+Pages, by how often they are used:
+  /                     Now — what the TV is doing, and the one thing to do about it
+  /ch/<n>               a channel: now playing + up next
+  /ch/<n>/add           add a video (once, or for good)
+  /ch/<n>/library       every video on the channel, or the removed ones
+  /ch/<n>/settings      YouTube playlists, name and colour, merge
+  /schedule             pause switch, today's timeline, the off periods
+  /schedule/<i>|new     edit or add one off period
+
+No JavaScript: the CSP forbids it, so every control is a link or a form.
 """
 
 import html as _html
@@ -11,10 +21,15 @@ import re
 import secrets
 import socket
 import threading
+from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote, urlsplit
 
-from schedule import get_periods, save_periods
+from schedule import (
+    get_periods, save_periods, get_manual_status, set_manual_status,
+    clear_manual_status, get_schedule_pause, pause_schedules, resume_schedules,
+    current_off_period, next_off_period, todays_periods,
+)
 from config import SCENES, CHANNELS, N
 from media import validate_youtube_url, validate_youtube_playlist_url, _SAFE_PLAYLIST_ID
 
@@ -23,8 +38,10 @@ from media import validate_youtube_url, validate_youtube_playlist_url, _SAFE_PLA
 # ─────────────────────────────────────────────
 
 MAX_BODY     = 16_384   # 16 KB hard cap on POST body (CWE-400)
-MAX_PERIODS  = 48       # hard cap on period count per request (CWE-400)
+MAX_PERIODS  = 48       # hard cap on the number of off periods (CWE-400)
 MAX_POSITION = 100_000  # hard cap on a feed position index (CWE-400)
+MAX_PAGE     = 1_000    # hard cap on a library page number (CWE-400)
+PAGE_SIZE    = 50       # library rows per page
 
 _CSRF_TOKEN = secrets.token_hex(16)
 
@@ -54,6 +71,7 @@ PORT = 8080
 #   remove_source (ch_idx, playlist_id) -> bool  stop syncing it
 #   save_channel  (ch_idx, name, emoji, color) -> bool
 #   merge     (src_idx, dst_idx) -> bool         empty src into dst
+#   tv        () -> {"state", "channel"}         what the TV is doing
 _callbacks: dict = {}
 
 
@@ -68,9 +86,24 @@ def _cb(name):
     return _callbacks.get(name)
 
 
+def _call(name, *args):
+    """Call a read-only callback; a failure renders as "unknown", never a 500."""
+    fn = _cb(name)
+    if not fn:
+        return None
+    try:
+        return fn(*args)
+    except Exception:                       # noqa: BLE001 - keep the page up
+        _log.exception("callback %s failed", name)
+        return None
+
+
 def _channel_info(ch_idx: int) -> dict | None:
-    fn = _cb("get")
-    return fn(ch_idx) if fn else None
+    return _call("get", ch_idx)
+
+
+def _tv_state() -> dict | None:
+    return _call("tv")
 
 
 # ─────────────────────────────────────────────
@@ -89,42 +122,12 @@ def _get_local_ip() -> str:
         return "127.0.0.1"
 
 
-# Channel sub-pages, whitelisted in the route itself (CWE-20).
-_SUBPAGES = ("videos", "ignored", "sources", "settings")
-_CH_PATH_RE = re.compile(r'^/ch/(\d{1,2})(?:/(' + "|".join(_SUBPAGES) + r'))?$')
-
-
-def _parse_channel_route(path: str) -> tuple[int, str] | None:
-    """Return (0-indexed channel, sub-page) for /ch/N[/sub], or None."""
-    m = _CH_PATH_RE.match(path)
-    if not m:
-        return None
-    n = int(m.group(1))
-    if 1 <= n <= N:
-        return n - 1, m.group(2) or ""
-    return None
-
-
-# ─────────────────────────────────────────────
-#  SCHEDULE PAGE
-# ─────────────────────────────────────────────
-
-_DAY_LABELS = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
-
-_SCENE_META = {
-    "sleeping":     ("\U0001f319", "#4ECDC4"),
-    "lunch":        ("\U0001f37d", "#FFD93D"),
-    "fixing":       ("\U0001f527", "#FF6B6B"),
-    "kita_goodbye": ("\U0001f392", "#6BCB77"),
-    "tubby":        ("\U0001f6c1", "#87CEEB"),
-}
-
 _esc = _html.escape
 
 _HEX_RE = re.compile(r"^#(?:[0-9A-Fa-f]{3}|[0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})$")
 
 
-def _safe_color(value, fallback: str = "#00ff88") -> str:
+def _safe_color(value, fallback: str = "#3DF2A0") -> str:
     """Whitelist a colour before it reaches a style attribute (CWE-20).
 
     Channel colours come from channels.json, which is hand-edited; anything
@@ -135,183 +138,324 @@ def _safe_color(value, fallback: str = "#00ff88") -> str:
     return fallback
 
 
-_COMMON_CSS = (
-    "*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}\n"
-    ":root{"
-    "--bg:#080416;--surface:#120a2c;--surface2:#1c0f44;"
-    "--border:#2e1c55;--border2:#43306e;"
-    "--green:#00ff88;--green-dim:#00301c;--red:#ff6b6b;--red-dim:#3a1520;"
-    "--teal:#4ECDC4;--yellow:#FFD93D;"
-    "--text:#e6e6f4;--text-mid:#a0a0c0;--text-dim:#7a7a9c;"
-    "--mono:'Courier New',Courier,monospace;"
-    "--ui:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;"
-    "--tap:46px}\n"
-    "html{height:100%;-webkit-text-size-adjust:100%;overflow-x:hidden}\n"
-    "body{font-family:var(--ui);font-size:15px;line-height:1.5;"
-    "background:var(--bg);color:var(--text);min-height:100vh;"
-    "padding-bottom:calc(var(--tap) + 34px)}\n"
-    ".skip{position:absolute;left:-9999px;top:0;background:var(--green);"
-    "color:#04101a;padding:10px 16px;font-weight:700;z-index:99}\n"
-    ".skip:focus{left:8px;top:8px}\n"
-    "header.top{background:var(--surface);border-bottom:1px solid var(--border);"
-    "position:sticky;top:0;z-index:20}\n"
-    ".brand{display:flex;align-items:center;gap:10px;padding:12px 16px 10px;"
-    "max-width:600px;margin:0 auto}\n"
-    ".brand h1{flex:0 1 auto;min-width:0;font-family:var(--mono);font-size:15px;letter-spacing:2px;"
-    "text-transform:uppercase;color:var(--green);font-weight:700}\n"
-    ".brand .where{margin-left:auto;flex:0 0 auto;font-size:11px;color:var(--text-dim);"
-    "font-family:var(--mono);letter-spacing:1px;text-align:right}\n"
-    "nav.tabs{display:flex;gap:2px;overflow-x:auto;padding:0 10px;"
-    "max-width:600px;margin:0 auto;scrollbar-width:none}\n"
-    "nav.tabs::-webkit-scrollbar{display:none}\n"
-    "nav.tabs a{flex:0 0 auto;display:flex;flex-direction:column;"
-    "align-items:center;gap:2px;min-width:74px;padding:7px 10px 9px;"
-    "text-decoration:none;color:var(--text-dim);font-size:11px;"
-    "border-bottom:3px solid transparent;transition:color .15s,border-color .15s}\n"
-    "nav.tabs a .ico{font-size:19px;line-height:1}\n"
-    "nav.tabs a .lbl{max-width:80px;overflow:hidden;text-overflow:ellipsis;"
-    "white-space:nowrap;letter-spacing:.5px}\n"
-    "nav.tabs a:hover{color:var(--text-mid)}\n"
-    "nav.tabs a[aria-current='page']{color:var(--text);"
-    "border-bottom-color:var(--tabcol,var(--green))}\n"
-    "main{max-width:600px;margin:0 auto;padding:16px}\n"
-    "h2.section{font-family:var(--mono);font-size:11px;letter-spacing:2.5px;"
-    "text-transform:uppercase;color:var(--text-dim);margin:22px 0 10px;"
-    "display:flex;align-items:center;gap:10px}\n"
-    "h2.section:first-child{margin-top:4px}\n"
-    "h2.section::after{content:'';flex:1;height:1px;background:var(--border)}\n"
-    ".note{font-size:12px;color:var(--text-dim);line-height:1.6;margin:8px 2px 0}\n"
-    ".flash{display:block;background:var(--green-dim);border:1px solid var(--green);"
-    "color:var(--green);padding:12px 14px;border-radius:10px;font-size:13px;"
-    "margin-bottom:16px}\n"
-    ".flash.err{background:var(--red-dim);border-color:var(--red);color:var(--red)}\n"
-    ".card{background:var(--surface);border:1px solid var(--border);"
-    "border-left:4px solid var(--accent,var(--border2));"
-    "border-radius:12px;padding:14px;margin-bottom:12px}\n"
-    ".card.muted{opacity:.55}\n"
-    ".card-head{display:flex;align-items:center;gap:10px;margin-bottom:12px}\n"
-    ".card-head .ico{font-size:20px;line-height:1}\n"
-    ".card-head h3{flex:0 1 auto;min-width:0;font-family:var(--mono);font-size:13px;letter-spacing:1px;"
-    "color:var(--text);font-weight:700}\n"
-    ".field{display:block;margin-bottom:12px}\n"
-    ".field>.lab,legend.lab{display:block;font-size:11px;letter-spacing:1.5px;"
-    "text-transform:uppercase;color:var(--text-dim);margin-bottom:6px;"
-    "font-family:var(--mono)}\n"
-    "input[type=time],input[type=text],select{width:100%;min-height:var(--tap);"
-    "padding:10px 12px;background:var(--surface2);color:var(--text);"
-    "border:1px solid var(--border2);border-radius:8px;font-size:15px;"
-    "font-family:var(--ui);outline:none;min-width:0}\n"
-    "input[type=time]{font-family:var(--mono)}\n"
-    "input:focus-visible,select:focus-visible,button:focus-visible,"
-    "a:focus-visible,summary:focus-visible{outline:2px solid var(--teal);"
-    "outline-offset:2px}\n"
-    ".times{display:flex;gap:10px;align-items:flex-end}\n"
-    ".times .field{flex:1;min-width:0;margin-bottom:0}\n"
-    ".times .sep{padding-bottom:13px;color:var(--text-dim);font-size:18px}\n"
-    "fieldset{border:0;margin:12px 0}\n"
-    ".chips{display:flex;gap:6px;flex-wrap:wrap}\n"
-    ".chips input{position:absolute;opacity:0;width:0;height:0}\n"
-    ".chips label{display:flex;align-items:center;justify-content:center;"
-    "min-width:42px;min-height:40px;padding:0 4px;border-radius:8px;"
-    "background:var(--surface2);border:1px solid var(--border2);"
-    "color:var(--text-dim);font-size:12px;font-family:var(--mono);"
-    "cursor:pointer;letter-spacing:.5px}\n"
-    ".chips input:checked+label{background:var(--green-dim);"
-    "border-color:var(--green);color:var(--green)}\n"
-    ".chips input:focus-visible+label{outline:2px solid var(--teal);outline-offset:2px}\n"
-    ".toggle{margin-left:auto;display:flex;align-items:center;gap:8px;"
-    "font-size:12px;color:var(--text-dim);cursor:pointer;min-height:40px}\n"
-    ".toggle input{width:20px;height:20px;accent-color:var(--yellow)}\n"
-    ".btn{display:flex;align-items:center;justify-content:center;gap:8px;"
-    "width:100%;min-height:var(--tap);padding:12px 16px;border-radius:9px;"
-    "border:1px solid var(--border2);background:var(--surface2);color:var(--text);"
-    "font-family:var(--ui);font-size:14px;font-weight:600;cursor:pointer;"
-    "text-decoration:none;transition:background .15s,border-color .15s,color .15s}\n"
-    ".btn:hover{border-color:var(--text-dim)}\n"
-    ".btn-primary{background:var(--green);border-color:var(--green);color:#04101a}\n"
-    ".btn-primary:hover{background:#4dffab;border-color:#4dffab}\n"
-    ".btn-accent{background:var(--accent,var(--teal));"
-    "border-color:var(--accent,var(--teal));color:#04101a}\n"
-    ".btn-danger{color:var(--red);border-color:#5a2633;background:transparent}\n"
-    ".btn-danger:hover{background:var(--red-dim);border-color:var(--red)}\n"
-    ".btn-sm{min-height:38px;padding:8px 12px;font-size:13px;width:auto;"
-    "flex:0 0 auto}\n"
-    ".btn-row{display:flex;gap:10px}\n"
-    ".btn-row .btn{flex:1}\n"
-    ".bar{position:fixed;left:0;right:0;bottom:0;z-index:20;"
-    "background:var(--surface);border-top:1px solid var(--border);"
-    "padding:10px 16px calc(10px + env(safe-area-inset-bottom,0px))}\n"
-    ".bar-inner{max-width:600px;margin:0 auto;display:flex;gap:10px;"
-    "align-items:center}\n"
-    ".bar .btn{flex:1}\n"
-    ".bar .info{font-size:12px;color:var(--text-dim);font-family:var(--mono);"
-    "letter-spacing:1px;display:flex;align-items:center;gap:8px}\n"
-    ".dot{width:8px;height:8px;border-radius:50%;background:var(--green);"
-    "box-shadow:0 0 8px var(--green);flex-shrink:0}\n"
-    ".dot.idle{background:var(--text-dim);box-shadow:none}\n"
-    ".empty{text-align:center;padding:30px 20px;border:1px dashed var(--border2);"
-    "border-radius:12px;color:var(--text-dim);font-size:13px;margin-bottom:12px}\n"
-    ".empty .ico{font-size:40px;display:block;margin-bottom:10px}\n"
-    "details{background:var(--surface);border:1px solid var(--border);"
-    "border-radius:12px;margin-bottom:12px;overflow:hidden}\n"
-    "summary{min-height:var(--tap);display:flex;align-items:center;gap:8px;"
-    "padding:12px 14px;cursor:pointer;font-size:13px;color:var(--text-mid);"
-    "list-style:none}\n"
-    "summary::-webkit-details-marker{display:none}\n"
-    "summary::after{content:'\\25be';margin-left:auto;color:var(--text-dim)}\n"
-    "details[open] summary::after{content:'\\25b4'}\n"
-    "details .body{padding:0 14px 14px}\n"
-)
+def _hm(h: int, m: int) -> str:
+    return f"{h:02d}:{m:02d}"
 
-_PAGE_CSS = (
-    ".np{background:var(--surface);border:1px solid var(--border);"
-    "border-left:4px solid var(--accent);border-radius:12px;padding:16px;"
-    "margin-bottom:12px}\n"
-    ".np-title{font-size:16px;font-weight:700;line-height:1.35;margin-bottom:4px}\n"
-    ".np-sub{font-size:12px;color:var(--text-dim);margin-bottom:12px}\n"
-    ".track{height:8px;background:var(--surface2);border-radius:4px;"
-    "overflow:hidden;margin-bottom:6px}\n"
-    ".track>span{display:block;height:100%;background:var(--accent);border-radius:4px}\n"
-    ".pct{font-size:11px;color:var(--text-dim);font-family:var(--mono);"
-    "margin-bottom:14px}\n"
-    ".queue{list-style:none;background:var(--surface);border:1px solid var(--border);"
-    "border-radius:12px;overflow:hidden;margin-bottom:8px}\n"
-    ".queue li{border-bottom:1px solid var(--border)}\n"
-    ".queue li:last-child{border-bottom:none}\n"
-    ".qrow{display:flex;align-items:center;gap:10px;padding:10px 12px}\n"
-    ".qnum{font-family:var(--mono);font-size:12px;color:var(--text-dim);"
-    "min-width:20px;text-align:right;flex-shrink:0}\n"
-    ".qtitle{flex:1;min-width:0;font-size:14px;overflow:hidden;text-overflow:ellipsis;"
-    "white-space:nowrap}\n"
-    ".tag{font-size:10px;font-family:var(--mono);letter-spacing:.5px;"
-    "padding:3px 6px;border-radius:5px;flex-shrink:0;"
-    "border:1px solid var(--border2);color:var(--text-dim)}\n"
-    ".tag.ok{color:var(--green);border-color:#0a5c38}\n"
-    ".tag.dl{color:var(--yellow);border-color:#6b5a14}\n"
-    ".tag.once{color:var(--teal);border-color:#1f6b66}\n"
-    ".legend{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:11px;"
-    "color:var(--text-dim);margin:0 2px 16px}\n"
-    ".legend b{color:var(--text-mid);font-weight:600}\n"
-    ".choice{background:var(--surface);border:1px solid var(--border);"
-    "border-radius:12px;padding:14px;margin-bottom:12px}\n"
-    ".choice+.choice{margin-top:-4px}\n"
-    ".lib{font-size:13px;color:var(--text-mid);line-height:1.8;"
-    "margin-bottom:12px}\n"
-    ".lib b{color:var(--text);font-weight:600}\n"
-    ".subtabs{display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;"
-    "margin:0 0 16px}\n"
-    ".subtabs a{flex:0 0 auto;padding:8px 12px;border-radius:8px;"
-    "border:1px solid var(--border2);color:var(--text-dim);text-decoration:none;"
-    "font-size:13px;white-space:nowrap}\n"
-    ".subtabs a[aria-current]{color:var(--text);border-color:var(--accent);"
-    "background:var(--surface2)}\n"
-    ".qmain{flex:1;min-width:0;display:flex;flex-direction:column}\n"
-    ".qfrom{font-size:11px;color:var(--text-dim);overflow:hidden;"
-    "text-overflow:ellipsis;white-space:nowrap}\n"
-    "input[type=color]{height:var(--tap);padding:4px}\n"
-    ".confirm{display:flex;gap:10px;align-items:flex-start;font-size:13px;"
-    "color:var(--text-mid);margin:12px 0}\n"
-    ".confirm input{width:20px;height:20px;flex-shrink:0;accent-color:var(--red)}\n"
+
+_CURRENT = ' aria-current="page"'
+_DOT = " · "
+
+
+def _current(flag: bool) -> str:
+    return _CURRENT if flag else ""
+
+
+def _csrf_field() -> str:
+    return f'<input type="hidden" name="csrf" value="{_CSRF_TOKEN}">'
+
+
+def _channel_name(ch_idx: int) -> str:
+    return CHANNELS[ch_idx].get("name") or f"Channel {ch_idx + 1}"
+
+
+# ─────────────────────────────────────────────
+#  ROUTING
+# ─────────────────────────────────────────────
+
+# Channel sub-pages, whitelisted in the route itself (CWE-20).  The old
+# sub-page names still resolve, so bookmarks keep working.
+_CH_SUBPAGES = {
+    "": "", "add": "add", "library": "library", "settings": "settings",
+    "videos": "library", "ignored": "removed", "sources": "settings",
+}
+_CH_PATH_RE = re.compile(
+    r'^/ch/(\d{1,2})(?:/(add|library|settings|videos|ignored|sources))?$')
+_SCHED_PATH_RE = re.compile(r'^/schedule(?:/(new|\d{1,2}))?$')
+
+
+def _split(raw_path: str) -> tuple[str, dict]:
+    """Split a request path into (path, query).  The query is size-capped."""
+    try:
+        parts = urlsplit(raw_path)
+        query = parse_qs(parts.query[:512], max_num_fields=8)
+    except ValueError:
+        return raw_path, {}
+    return parts.path, query
+
+
+def _parse_channel_route(path: str) -> tuple[int, str] | None:
+    """Return (0-indexed channel, sub-page) for /ch/N[/sub], or None."""
+    m = _CH_PATH_RE.match(path)
+    if not m:
+        return None
+    n = int(m.group(1))
+    if 1 <= n <= N:
+        return n - 1, _CH_SUBPAGES[m.group(2) or ""]
+    return None
+
+
+def _parse_schedule_route(path: str):
+    """Return "list", "new" or a period index for /schedule[/…], or None."""
+    m = _SCHED_PATH_RE.match(path)
+    if not m:
+        return None
+    target = m.group(1)
+    if target is None:
+        return "list"
+    if target == "new":
+        return "new"
+    i = int(target)
+    return i if i < MAX_PERIODS else None
+
+
+def _library_view(sub: str, query: dict) -> tuple[str, int]:
+    """Whitelist the library filter and bound the page number (CWE-20/400)."""
+    show = "removed" if sub == "removed" or query.get("show", [""])[0] == "removed" else ""
+    try:
+        page = int(query.get("page", ["1"])[0])
+    except ValueError:
+        page = 1
+    return show, max(1, min(MAX_PAGE, page))
+
+
+# ─────────────────────────────────────────────
+#  SCENES — friendly names and line icons
+# ─────────────────────────────────────────────
+
+# (short name, accent colour, inline SVG paths).  SCENES' own labels are the
+# shouty on-screen captions; the remote uses these instead.
+_SCENE_UI = {
+    "tubby":        ("Bath time", "#7FD6F5",
+                     '<path d="M3 12h18v3a5 5 0 0 1-5 5H8a5 5 0 0 1-5-5z"/>'
+                     '<path d="M6 12V6a2 2 0 0 1 4 0"/><path d="M7 20l-1 2M17 20l1 2"/>'),
+    "lunch":        ("Lunch", "#FFD166",
+                     '<path d="M4 3v8a3 3 0 0 0 6 0V3M7 3v18"/>'
+                     '<path d="M17 3c-2 2-2 6 0 8v10"/>'),
+    "sleeping":     ("Sleep", "#B9A6FF",
+                     '<path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/>'),
+    "kita_goodbye": ("Kita", "#7EE0A1",
+                     '<rect x="5" y="7" width="14" height="14" rx="3"/>'
+                     '<path d="M9 7V5a3 3 0 0 1 6 0v2M9 13h6"/>'),
+    "fixing":       ("Engineers", "#FF9F7A",
+                     '<path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 '
+                     '5.4-5.4l-2.5 2.5-2.4-.6-.6-2.4z"/>'),
+}
+_CLOCK_PATHS = '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>'
+
+
+def _scene_order() -> list[str]:
+    known = [s for s in _SCENE_UI if s in SCENES]
+    return known + [s for s in SCENES if s not in _SCENE_UI]
+
+
+def _scene_name(scene: str) -> str:
+    if scene in _SCENE_UI:
+        return _SCENE_UI[scene][0]
+    return SCENES.get(scene, {}).get("label", scene).title()
+
+
+def _scene_color(scene: str) -> str:
+    return _SCENE_UI.get(scene, ("", "#C9C0E8", ""))[1]
+
+
+def _icon(paths: str, size: int = 22, color: str = "currentColor",
+          width: float = 2) -> str:
+    return (f'<svg width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" '
+            f'stroke="{color}" stroke-width="{width}" stroke-linecap="round" '
+            f'stroke-linejoin="round" aria-hidden="true">{paths}</svg>')
+
+
+def _scene_icon(scene: str, size: int = 22) -> str:
+    paths = _SCENE_UI[scene][2] if scene in _SCENE_UI else _CLOCK_PATHS
+    return _icon(paths, size, _scene_color(scene))
+
+
+_I_SKIP    = '<path d="M5 4l10 8-10 8z"/><path d="M19 5v14"/>'
+_I_PLAY    = '<path d="M6 4l14 8-14 8z"/>'
+_I_POWER   = '<path d="M12 3v9"/><path d="M6.3 7.3a8 8 0 1 0 11.4 0"/>'
+_I_PLUS    = '<path d="M12 5v14M5 12h14"/>'
+_I_NEXT    = '<path d="M9 6l6 6-6 6"/>'
+_I_BACK    = '<path d="M15 6l-6 6 6 6"/>'
+_I_SYNC    = '<path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/>'
+_I_TV      = '<rect x="3" y="5" width="18" height="12" rx="2"/><path d="M8 21h8"/>'
+_I_LIST    = '<path d="M4 6h16M4 12h16M4 18h10"/>'
+_I_CLOCK   = _CLOCK_PATHS
+_I_CHECK   = '<path d="M5 12l5 5L20 7"/>'
+_DOTS = ('<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" '
+         'aria-hidden="true"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" '
+         'r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>')
+
+
+# ─────────────────────────────────────────────
+#  STYLE
+# ─────────────────────────────────────────────
+
+_CSS = (
+    ":root{--bg:#0B0718;--surface:#160F2E;--surface2:#211846;--line:#2E2458;"
+    "--line2:#3A2F6E;--text:#F1EDFF;--mid:#C9C0E8;--dim:#A79DD0;--green:#3DF2A0;"
+    "--amber:#FFB547;--lilac:#C9B8FF;--red:#FF8FA0;--tap:48px;"
+    "--ui:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;"
+    "--mono:ui-monospace,'Cascadia Mono',Consolas,monospace;color-scheme:dark}\n"
+    "*,*::before,*::after{box-sizing:border-box}\n"
+    "html{-webkit-text-size-adjust:100%}\n"
+    "body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 var(--ui);"
+    "padding-bottom:calc(72px + env(safe-area-inset-bottom))}\n"
+    "body.pinned{padding-bottom:calc(148px + env(safe-area-inset-bottom))}\n"
+    "a{color:var(--green)}\n"
+    "main{max-width:560px;margin:0 auto;padding:18px 16px 24px;display:flex;"
+    "flex-direction:column;gap:22px}\n"
+    "h1{margin:0;font-size:24px;line-height:1.25}\n"
+    "h2{margin:0}\n"
+    ".skip-link{position:absolute;left:-999px}.skip-link:focus{left:8px;top:8px;"
+    "background:var(--surface);padding:8px;z-index:50}\n"
+    ".lbl{font:11px var(--mono);letter-spacing:1.6px;text-transform:uppercase;"
+    "color:var(--dim);margin:0}\n"
+    ".note{margin:0;font-size:13px;color:var(--mid)}\n"
+    ".dim{color:var(--dim)}\n"
+    ".stack{display:flex;flex-direction:column;gap:10px}\n"
+    ".brand{display:flex;justify-content:space-between;align-items:center}\n"
+    ".flash{background:#0F2A22;border:1px solid #1E6B4E;color:#BFFBE0;padding:12px 14px;"
+    "border-radius:12px;font-size:14px}\n"
+    ".flash.err{background:#2A1220;border-color:#6B2A3A;color:#FFD0D8}\n"
+    # cards / hero
+    ".card{background:var(--surface);border:1px solid var(--line);border-radius:16px;"
+    "padding:16px;display:flex;flex-direction:column;gap:12px}\n"
+    ".hero{border-radius:18px;padding:20px 18px;gap:16px}\n"
+    ".hero.on{border-color:#2B5C49}.hero.on .lbl{color:var(--green)}\n"
+    ".hero.manual{background:#1E1528;border-color:#6B4A1F}.hero.manual .lbl{color:var(--amber)}\n"
+    ".hero.sched{background:#19132E;border-color:#4A3D86}.hero.sched .lbl{color:var(--lilac)}\n"
+    ".hero-row{display:flex;align-items:center;gap:14px}\n"
+    ".badge{width:52px;height:52px;border-radius:14px;background:#211846;display:flex;"
+    "align-items:center;justify-content:center;flex-shrink:0}\n"
+    ".big{margin:0;font-size:26px;font-weight:700;line-height:1.2}\n"
+    ".title{margin:0;font-size:20px;font-weight:700;line-height:1.3}\n"
+    ".chan{display:flex;align-items:center;gap:8px;text-decoration:none;"
+    "color:var(--mid);font-size:13px;font-weight:600}\n"
+    ".sq{width:10px;height:10px;border-radius:3px;flex-shrink:0}\n"
+    ".track{height:6px;border-radius:3px;background:#2A2150;overflow:hidden}\n"
+    ".track span{display:block;height:100%}\n"
+    # buttons
+    ".btn{display:flex;align-items:center;justify-content:center;gap:8px;"
+    "min-height:var(--tap);padding:0 16px;border-radius:12px;border:1px solid var(--line2);"
+    "background:var(--surface2);color:var(--text);font:600 15px var(--ui);"
+    "text-decoration:none;cursor:pointer;width:100%}\n"
+    ".btn-main{min-height:54px;border:0;border-radius:14px;background:var(--green);"
+    "color:#06140D;font-weight:700;font-size:16px}\n"
+    ".btn-amber{background:var(--amber);color:#241503}\n"
+    ".btn-ghost{background:transparent}\n"
+    ".btn-danger{background:transparent;border-color:#5A2633;color:var(--red)}\n"
+    ".btn-sm{min-height:40px;width:auto;padding:0 12px;font-size:13px;border-radius:10px}\n"
+    ".btn-row{display:flex;gap:10px}.btn-row>*{flex:1}\n"
+    "form{margin:0}\n"
+    # scene tiles / chips
+    ".tiles{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}\n"
+    ".tile{display:flex;flex-direction:column;align-items:flex-start;gap:10px;"
+    "min-height:76px;padding:14px;border-radius:14px;background:#1A1236;"
+    "border:1px solid var(--line);color:var(--text);font:600 15px var(--ui);"
+    "text-align:left;cursor:pointer;width:100%}\n"
+    ".chips{display:flex;flex-wrap:wrap;gap:8px}\n"
+    ".chip{display:flex;align-items:center;gap:8px;min-height:44px;padding:0 14px;"
+    "border-radius:12px;background:#1A1236;border:1px solid var(--line);"
+    "color:var(--text);font:600 14px var(--ui);cursor:pointer;text-decoration:none}\n"
+    # lists
+    ".list{list-style:none;margin:0;padding:0;background:var(--surface);"
+    "border:1px solid var(--line);border-radius:16px;overflow:hidden}\n"
+    ".list>li+li{border-top:1px solid var(--line)}\n"
+    ".row{display:flex;align-items:center;gap:12px;min-height:58px;padding:8px 8px 8px 14px;"
+    "color:var(--text);text-decoration:none}\n"
+    ".row .main{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}\n"
+    ".row .t{font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;"
+    "text-overflow:ellipsis}\n"
+    ".row .s{font-size:12px;color:var(--dim);white-space:nowrap;overflow:hidden;"
+    "text-overflow:ellipsis}\n"
+    ".num{width:34px;height:34px;border-radius:9px;font-weight:800;display:flex;"
+    "align-items:center;justify-content:center;color:#0B0718;flex-shrink:0}\n"
+    ".tag{font:600 11px var(--ui);padding:3px 8px;border-radius:6px;background:#2A2150;"
+    "color:var(--mid);flex-shrink:0}\n"
+    ".tag.on{background:#233D33;color:#7EF0B8}\n"
+    ".once{background:#10273A}.once .s{color:#7FD6F5}\n"
+    # up-next rows: the whole row is a <summary>, its actions the <details>
+    # body — native show/hide, no JS and no :has() needed
+    "details.more summary{list-style:none;cursor:pointer}\n"
+    "details.more summary::-webkit-details-marker{display:none}\n"
+    ".dots{width:44px;height:44px;border-radius:10px;display:flex;align-items:center;"
+    "justify-content:center;color:var(--dim);flex-shrink:0}\n"
+    "details.more[open]{background:#1B1338}\n"
+    "details.more[open] .dots{color:var(--text);background:var(--surface2)}\n"
+    ".menu{display:flex;gap:8px;padding:0 8px 12px 14px}\n"
+    # channel header
+    ".switch{display:flex;gap:8px}\n"
+    ".sw{flex:1;min-width:0;display:flex;align-items:center;justify-content:center;gap:8px;"
+    "min-height:44px;padding:0 10px;border-radius:12px;border:1px solid var(--line);"
+    "background:#140E28;color:var(--mid);font:600 14px var(--ui);text-decoration:none}\n"
+    ".sw span:last-child{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}\n"
+    ".sw[aria-current]{color:var(--text);background:#21173A}\n"
+    ".seg{display:flex;gap:4px;padding:4px;background:#140E28;border:1px solid var(--line);"
+    "border-radius:12px}\n"
+    ".seg a{flex:1;display:flex;align-items:center;justify-content:center;min-height:40px;"
+    "border-radius:9px;color:var(--dim);font:600 13px var(--ui);text-decoration:none}\n"
+    ".seg a[aria-current]{background:#2A2052;color:var(--text)}\n"
+    ".pills{display:flex;gap:8px;flex-wrap:wrap}\n"
+    ".pill{display:flex;align-items:center;min-height:36px;padding:0 12px;border-radius:18px;"
+    "border:1px solid var(--line2);color:var(--mid);font:600 13px var(--ui);text-decoration:none}\n"
+    ".pill[aria-current]{background:var(--text);color:var(--bg);border-color:var(--text)}\n"
+    ".linkcard{display:flex;align-items:center;gap:12px;padding:14px;border-radius:14px;"
+    "border:1px dashed var(--line2);text-decoration:none;color:var(--text)}\n"
+    # forms
+    ".field{display:flex;flex-direction:column;gap:6px}\n"
+    ".in{min-height:50px;width:100%;padding:0 14px;border-radius:12px;"
+    "border:1px solid var(--line2);background:#1A1236;color:var(--text);font:15px var(--ui)}\n"
+    ".in:focus,.btn:focus-visible,.tile:focus-visible,.chip:focus-visible{outline:2px solid "
+    "var(--green);outline-offset:2px}\n"
+    "fieldset{border:0;margin:0;padding:0;min-width:0}\n"
+    "legend{padding:0;margin-bottom:10px}\n"
+    ".opt{display:flex;gap:14px;align-items:flex-start;padding:16px;border-radius:14px;"
+    "background:var(--surface);border:1px solid var(--line);cursor:pointer}\n"
+    ".opt input{width:22px;height:22px;margin:2px 0 0;accent-color:var(--green);flex-shrink:0}\n"
+    ".opt:has(input:checked){border-color:var(--green);background:#0F2A22}\n"
+    ".opt b{display:block;font-size:16px}\n"
+    ".pick{position:relative}\n"
+    ".pick input{position:absolute;opacity:0;width:1px;height:1px}\n"
+    ".pick span{display:flex;align-items:center;gap:10px;min-height:50px;padding:0 14px;"
+    "border-radius:12px;border:1px solid var(--line);background:var(--surface);"
+    "font:600 14px var(--ui);cursor:pointer}\n"
+    ".pick input:checked+span{border-color:var(--text);background:#2A2150}\n"
+    ".pick input:focus-visible+span{outline:2px solid var(--green);outline-offset:2px}\n"
+    ".days{display:flex;gap:5px}.days .pick{flex:1}\n"
+    ".days .pick span{justify-content:center;padding:0;min-height:44px;font-size:13px}\n"
+    ".days .pick input:checked+span{border-color:var(--green);background:#233D33}\n"
+    ".swatches{display:flex;gap:10px;flex-wrap:wrap}\n"
+    ".swatches .pick span{width:40px;min-height:40px;border-radius:10px;padding:0;border:2px solid transparent}\n"
+    ".swatches .pick input:checked+span{border-color:var(--text);box-shadow:0 0 0 2px var(--bg) inset}\n"
+    ".checkbtn{display:flex;align-items:center;gap:14px;width:100%;padding:16px;"
+    "border-radius:16px;background:var(--surface);border:1px solid var(--line);color:var(--text);"
+    "text-align:left;font:15px var(--ui);cursor:pointer}\n"
+    ".box{width:26px;height:26px;border-radius:7px;border:2px solid var(--dim);display:flex;"
+    "align-items:center;justify-content:center;flex-shrink:0;color:#241503}\n"
+    ".checkbtn[aria-pressed=true]{border-color:#6B4A1F;background:#1E1528}\n"
+    ".checkbtn[aria-pressed=true] .box{background:var(--amber);border-color:var(--amber)}\n"
+    "details.danger{border:1px solid #3A2633;border-radius:14px;background:#150D1E}\n"
+    "details.danger summary{min-height:48px;display:flex;align-items:center;padding:0 14px;"
+    "font-weight:600;color:var(--red);cursor:pointer}\n"
+    "details.danger .body{padding:0 14px 14px;display:flex;flex-direction:column;gap:12px}\n"
+    # timeline
+    ".timeline{position:relative;height:40px;border-radius:10px;background:#183A2E;overflow:hidden}\n"
+    ".timeline span{position:absolute;top:0;bottom:0;background:#4A3D86}\n"
+    ".timeline.paused{background:#262040}.timeline.paused span{background:#3A3358}\n"
+    ".timeline i{position:absolute;top:-2px;bottom:-2px;width:2px;background:var(--text)}\n"
+    ".hours{display:flex;justify-content:space-between;font:11px var(--mono);color:var(--dim)}\n"
+    ".empty{text-align:center;padding:28px 16px;border:1px dashed var(--line2);"
+    "border-radius:16px;color:var(--mid);font-size:14px}\n"
+    # bottom bars
+    ".pin{position:fixed;left:0;right:0;bottom:calc(64px + env(safe-area-inset-bottom));"
+    "padding:12px 16px;background:var(--bg);border-top:1px solid #1E1740}\n"
+    ".pin>*{max-width:528px;margin:0 auto}\n"
+    "nav.tabbar{position:fixed;left:0;right:0;bottom:0;display:flex;background:#120B26;"
+    "border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom);z-index:20}\n"
+    "nav.tabbar a{flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;"
+    "padding:10px 0 12px;text-decoration:none;color:var(--dim);font:600 11px var(--ui)}\n"
+    "nav.tabbar a[aria-current]{color:var(--green)}\n"
+    ".sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}\n"
 )
 
 
@@ -319,545 +463,817 @@ _PAGE_CSS = (
 #  SHARED PAGE CHROME
 # ─────────────────────────────────────────────
 
-def _nav(active: str) -> str:
-    """Primary tab bar, on every page, so nav is always one tap away."""
-    items = [("/", "\U0001f4c5", "Schedule", "schedule", "#00ff88")]
-    for i, ch in enumerate(CHANNELS):
-        items.append((
-            f"/ch/{i + 1}",
-            ch.get("emoji", "\U0001f4fa"),
-            ch.get("name", f"CH {i + 1}"),
-            f"ch{i + 1}",
-            _safe_color(ch.get("color")),
-        ))
-
-    out = []
-    for href, icon, label, key, color in items:
-        current = ' aria-current="page"' if key == active else ""
-        out.append(
-            f'<a href="{href}"{current} style="--tabcol:{color}">'
-            f'<span class="ico" aria-hidden="true">{icon}</span>'
-            f'<span class="lbl">{_esc(label)}</span></a>'
-        )
-    return f'<nav class="tabs" aria-label="Sections">{"".join(out)}</nav>'
-
-
 def _flash(message: str) -> str:
     """Status banner.  A leading cross marks the message as an error."""
     if not message:
         return ""
-    err = message.startswith("\u274c")
+    err = message.startswith("❌")
     cls = "flash err" if err else "flash"
     role = "alert" if err else "status"
     return f'<div class="{cls}" role="{role}">{_esc(message)}</div>'
 
 
-def _shell(title: str, active: str, body: str,
-           where: str = "", bar: str = "", css: str = "") -> str:
-    """Document chrome: head, header + tabs, main, optional sticky bottom bar.
+def _tabbar(active: str) -> str:
+    tv = _tv_state() or {}
+    try:
+        on_screen = int(tv.get("channel", 0))
+    except (TypeError, ValueError):
+        on_screen = 0
+    on_screen = on_screen if 0 <= on_screen < N else 0
+    tabs = [("now", "/", _I_TV, "Now"),
+            ("channels", f"/ch/{on_screen + 1}", _I_LIST, "Channels"),
+            ("schedule", "/schedule", _I_CLOCK, "Schedule")]
+    links = "".join(
+        f'<a href="{href}"{_current(key == active)}>{_icon(icon)}{label}</a>'
+        for key, href, icon, label in tabs
+    )
+    return f'<nav class="tabbar" aria-label="Sections">{links}</nav>'
 
-    `bar` is left empty by pages that render their own bar inside a form, so
-    that its buttons submit that form.
-    """
-    bar_html = (f'<div class="bar"><div class="bar-inner">{bar}</div></div>\n'
-                if bar else "")
+
+def _shell(title: str, active: str, body: str, pinned: str = "") -> str:
+    """Document chrome: head, main, an optional pinned action, the tab bar."""
+    pin_html = f'<div class="pin">{pinned}</div>' if pinned else ""
+    body_open = '<body class="pinned">' if pinned else "<body>"
     return (
         "<!DOCTYPE html>\n"
         '<html lang="en">\n'
         "<head>\n"
         '<meta charset="utf-8">\n'
-        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">\n'
         '<meta name="color-scheme" content="dark">\n'
-        f"<title>{_esc(title)}</title>\n"
-        "<style>\n" + _COMMON_CSS + css + "</style>\n"
+        '<meta name="theme-color" content="#0B0718">\n'
+        f"<title>{_esc(title)} — Toddler TV</title>\n"
+        f"<style>\n{_CSS}</style>\n"
         "</head>\n"
-        "<body>\n"
-        '<a class="skip" href="#main">Skip to content</a>\n'
-        '<header class="top">\n'
-        '<div class="brand"><span aria-hidden="true">\U0001f4fa</span>'
-        "<h1>Toddler TV</h1>"
-        f'<span class="where">{_esc(where)}</span></div>\n'
-        f"{_nav(active)}\n"
-        "</header>\n"
+        f"{body_open}\n"
+        '<a class="skip-link" href="#main">Skip to content</a>\n'
         f'<main id="main">{body}</main>\n'
-        f"{bar_html}"
-        "</body>\n"
-        "</html>"
+        f"{pin_html}{_tabbar(active)}\n"
+        "</body>\n</html>"
     )
+
+
+def _offline() -> str:
+    return ('<div class="empty">The TV app is not running.<br>'
+            "Start it to see and control the channels.</div>")
 
 
 # ─────────────────────────────────────────────
-#  SCHEDULE PAGE
+#  NOW PAGE
 # ─────────────────────────────────────────────
 
-def _period_card(i: int, period) -> str:
-    """One off-period.  Every control carries a visible label."""
-    if len(period) >= 7:
-        sh, sm, eh, em, scene, days, paused = period[:7]
-    else:
-        sh, sm, eh, em, scene = period[:5]
-        days, paused = [], False
+def _now_minutes() -> int:
+    now = datetime.now()
+    return now.hour * 60 + now.minute
 
-    emoji, accent = _SCENE_META.get(scene, ("\u23f0", "#00ff88"))
-    accent = _safe_color(accent)
 
-    options = "".join(
-        f'<option value="{s}"{" selected" if s == scene else ""}>'
-        f'{_esc(SCENES[s]["label"])}</option>'
-        for s in SCENES
+def _scheduled_now() -> tuple | None:
+    """The scheduled period covering now (ignoring overrides), or None."""
+    now = _now_minutes()
+    for start, end, scene in todays_periods():
+        if start <= now < end:
+            return start, end, scene
+    return None
+
+
+def _after_status_text(pause: dict | None) -> str:
+    """What happens once a manual status ends."""
+    if pause:
+        return "Afterwards the TV comes back on — schedules are paused."
+    current = _scheduled_now()
+    if current:
+        start, end, scene = current
+        return (f"Afterwards the schedule takes over: <b>{_esc(_scene_name(scene))} "
+                f"until {_hm(end // 60, end % 60)}</b>.")
+    nxt = next_off_period()
+    if nxt:
+        return (f"Afterwards the TV comes back on. Next on the schedule: "
+                f"<b>{_esc(_scene_name(nxt['scene']))} at "
+                f"{_hm(nxt['start_h'], nxt['start_m'])}</b>.")
+    return "Afterwards the TV comes back on."
+
+
+def _scene_buttons(exclude: str | None, style: str) -> str:
+    """Scene tiles or chips; each one switches a manual status on."""
+    cls = "tile" if style == "tiles" else "chip"
+    buttons = "".join(
+        f'<button type="submit" name="scene" value="{_esc(s)}" class="{cls}">'
+        f"{_scene_icon(s, 22 if style == 'tiles' else 18)}{_esc(_scene_name(s))}</button>"
+        for s in _scene_order() if s != exclude
     )
+    wrap = "tiles" if style == "tiles" else "chips"
+    return (f'<form method="POST" action="/">{_csrf_field()}'
+            f'<input type="hidden" name="action" value="status_on">'
+            f'<div class="{wrap}">{buttons}</div></form>')
 
-    days_set = set(days) if days else set(range(7))
-    chips = "".join(
-        f'<input type="checkbox" id="d{d}_{i}" name="days_{i}" value="{d}"'
-        f'{" checked" if d in days_set else ""}>'
-        f'<label for="d{d}_{i}">{lab}</label>'
-        for d, lab in enumerate(_DAY_LABELS)
-    )
 
-    label_txt = _esc(SCENES.get(scene, {}).get("label", scene))
+def _hero_playing(tv: dict) -> str:
+    ch_idx = tv.get("channel", 0)
+    ch_idx = ch_idx if isinstance(ch_idx, int) and 0 <= ch_idx < N else 0
+    info = _channel_info(ch_idx) or {}
+    cur = info.get("current") or {}
+    color = _safe_color(CHANNELS[ch_idx].get("color"))
+    n = ch_idx + 1
+    chan = (f'<a class="chan" href="/ch/{n}"><span class="sq" style="background:{color}">'
+            f"</span>{_esc(_channel_name(ch_idx))}</a>")
+
+    if tv.get("state") != "playing" or not cur:
+        what = ("Starting up…" if tv.get("state") == "booting"
+                else f"Loading {_channel_name(ch_idx)}…")
+        return (f'<section class="card hero on" aria-label="On screen now">'
+                f'<div class="brand"><p class="lbl">Getting ready</p>{chan}</div>'
+                f'<p class="title">{_esc(what)}</p></section>')
+
+    pct = min(100, max(0, int((cur.get("progress") or 0.0) * 100)))
     return (
-        f'<section class="card{" muted" if paused else ""}" style="--accent:{accent}">'
-        f'<div class="card-head">'
-        f'<span class="ico" aria-hidden="true">{emoji}</span>'
-        f"<h3>Period {i + 1}</h3>"
-        f'<label class="toggle" for="paused_{i}">'
-        f'<input type="checkbox" id="paused_{i}" name="paused_{i}" value="1"'
-        f'{" checked" if paused else ""}>Paused</label>'
-        f"</div>"
-        f'<div class="times">'
-        f'<label class="field"><span class="lab">TV off from</span>'
-        f'<input type="time" name="start_{i}" value="{sh:02d}:{sm:02d}"></label>'
-        f'<span class="sep" aria-hidden="true">\u2192</span>'
-        f'<label class="field"><span class="lab">until</span>'
-        f'<input type="time" name="end_{i}" value="{eh:02d}:{em:02d}"></label>'
-        f"</div>"
-        f'<fieldset><legend class="lab">Repeat on</legend>'
-        f'<div class="chips">{chips}</div></fieldset>'
-        f'<label class="field"><span class="lab">Show on screen</span>'
-        f'<select name="scene_{i}">{options}</select></label>'
-        f'<button type="submit" name="delete" value="{i}" class="btn btn-danger">'
-        f'<span aria-hidden="true">\U0001f5d1</span> Delete this period</button>'
-        f'<p class="note">While this period runs the TV shows '
-        f"&ldquo;{label_txt}&rdquo; instead of videos.</p>"
+        f'<section class="card hero on" aria-label="On screen now">'
+        f'<div class="brand"><p class="lbl">Playing now</p>{chan}</div>'
+        f'<h1 class="title">{_esc(cur.get("title") or "Unknown")}</h1>'
+        f'<div class="track" role="img" aria-label="{pct}% watched">'
+        f'<span style="width:{pct}%;background:var(--green)"></span></div>'
+        f'<div class="btn-row">'
+        f'<form method="POST" action="/">{_csrf_field()}'
+        f'<input type="hidden" name="ch" value="{n}">'
+        f'<button type="submit" name="action" value="skip" class="btn">'
+        f"{_icon(_I_SKIP, 18)}Skip video</button></form>"
+        f'<a class="btn btn-ghost" href="/ch/{n}">Up next</a></div>'
         f"</section>"
     )
 
 
-def _build_page(periods: list, message: str = "") -> str:
-    cards = "".join(_period_card(i, p) for i, p in enumerate(periods))
-    if not cards:
-        cards = (
-            '<div class="empty">'
-            '<span class="ico" aria-hidden="true">\U0001f916</span>'
-            "No off-periods yet \u2014 the TV will play all day.<br>"
-            "Tap <strong>Add period</strong> below to set quiet time."
-            "</div>"
-        )
-
-    active = sum(1 for p in periods if not (p[6] if len(p) >= 7 else False))
-
-    # The sticky bar is inside the form so its buttons submit it, so the
-    # shell's own bar slot stays empty on this page.
-    body = (
-        f"{_flash(message)}"
-        f'<form method="POST" action="/">'
-        f'<input type="hidden" name="count" value="{len(periods)}">'
-        f'<input type="hidden" name="csrf" value="{_CSRF_TOKEN}">'
-        f'<h2 class="section">Off periods</h2>'
-        f'<p class="note" style="margin:0 2px 14px">Times when the TV shows a '
-        f"robot scene instead of videos.</p>"
-        f"{cards}"
-        f'<div class="bar"><div class="bar-inner">'
-        f'<button type="submit" name="action" value="add" class="btn">'
-        f'<span aria-hidden="true">+</span> Add period</button>'
-        f'<button type="submit" name="action" value="save" class="btn btn-primary">'
-        f"Save changes</button>"
-        f"</div></div>"
-        f"</form>"
+def _hero_manual(status: dict, pause: dict | None) -> str:
+    scene = status["scene"]
+    since = _esc(status.get("since") or "")
+    since_txt = f"Since {since}{_DOT}" if since else ""
+    return (
+        f'<section class="card hero manual" aria-label="TV is off">'
+        f'<p class="lbl">TV is off · you switched it</p>'
+        f'<div class="hero-row"><span class="badge">{_scene_icon(scene, 28)}</span>'
+        f'<div><h1 class="big">{_esc(_scene_name(scene))}</h1>'
+        f'<p class="note">{since_txt}stays on until you end it</p></div></div>'
+        f'<form method="POST" action="/">{_csrf_field()}'
+        f'<button type="submit" name="action" value="status_off" class="btn btn-main btn-amber">'
+        f"{_icon(_I_POWER, 20, width=2.2)}End {_esc(_scene_name(scene).lower())}</button></form>"
+        f'<p class="note">{_after_status_text(pause)}</p>'
+        f"</section>"
     )
-    return _shell("Schedule \u2014 Toddler TV Remote", "schedule", body,
-                  where=f"{active} of {len(periods)} on")
+
+
+def _hero_scheduled(period: dict) -> str:
+    scene = period["scene"]
+    start = period["start_h"] * 60 + period["start_m"]
+    end = period["end_h"] * 60 + period["end_m"]
+    now = _now_minutes()
+    left = max(0, end - now)
+    pct = min(100, max(0, int((now - start) * 100 / max(1, end - start))))
+    left_txt = f"{left} min left" if left < 60 else f"{left // 60} h {left % 60} min left"
+    return (
+        f'<section class="card hero sched" aria-label="TV is off">'
+        f'<p class="lbl">TV is off · on the schedule</p>'
+        f'<div class="hero-row"><span class="badge">{_scene_icon(scene, 28)}</span>'
+        f'<div><h1 class="big">{_esc(_scene_name(scene))}</h1>'
+        f'<p class="note">Back on at <b>{_hm(period["end_h"], period["end_m"])}</b> '
+        f"· {left_txt}</p></div></div>"
+        f'<div class="track" role="img" aria-label="{pct}% of this break done">'
+        f'<span style="width:{pct}%;background:var(--lilac)"></span></div>'
+        f'<form method="POST" action="/">{_csrf_field()}'
+        f'<button type="submit" name="action" value="schedules_pause" class="btn btn-main">'
+        f"{_icon(_I_PLAY, 20, width=2.2)}Turn the TV on</button></form>"
+        f'<p class="note">This pauses all schedules until you resume them on the '
+        f'<a href="/schedule">Schedule</a> tab.</p>'
+        f"</section>"
+    )
+
+
+def _hero_power_off() -> str:
+    return (
+        '<section class="card hero" aria-label="TV is off">'
+        '<p class="lbl">TV is off · power button</p>'
+        '<h1 class="big">Switched off on the TV</h1>'
+        '<p class="note">Press the power button on the TV to turn it back on.</p>'
+        "</section>"
+    )
+
+
+def _channel_rows(tv: dict | None) -> str:
+    """Compact channel list for the Now page."""
+    on_screen = tv.get("channel") if tv and tv.get("state") == "playing" else None
+    rows = []
+    for i, ch in enumerate(CHANNELS):
+        info = _channel_info(i) or {}
+        cur = info.get("current") or {}
+        if i == on_screen:
+            sub = '<span class="s" style="color:var(--green)">On screen</span>'
+        elif info and not info.get("feed_size"):
+            sub = '<span class="s" style="color:var(--amber)">No videos yet — add a playlist</span>'
+        elif cur.get("title"):
+            sub = f'<span class="s">{_esc(cur["title"])}</span>'
+        else:
+            sub = '<span class="s">Loading…</span>'
+        color = _safe_color(ch.get("color"))
+        rows.append(
+            f'<li><a class="row" href="/ch/{i + 1}">'
+            f'<span class="num" style="background:{color}">{i + 1}</span>'
+            f'<span class="main"><span class="t">{_esc(_channel_name(i))}</span>{sub}</span>'
+            f"{_icon(_I_NEXT, 18, 'var(--dim)')}</a></li>"
+        )
+    return f'<ul class="list">{"".join(rows)}</ul>'
+
+
+def _channel_chips() -> str:
+    """While the TV is off: channels are still one tap away for editing."""
+    chips = "".join(
+        f'<a class="sw" href="/ch/{i + 1}"><span class="sq" '
+        f'style="background:{_safe_color(ch.get("color"))}"></span><span>{_esc(_channel_name(i))}</span></a>'
+        for i, ch in enumerate(CHANNELS)
+    )
+    return (f'<div class="card"><p class="note">Channels are paused while the TV is off. '
+            f'You can still change what’s on them.</p><div class="switch">{chips}</div></div>')
+
+
+def _build_now_page(message: str = "") -> str:
+    tv = _tv_state()
+    status = get_manual_status()
+    pause = get_schedule_pause()
+    period = current_off_period()      # manual status first, then the schedule
+
+    brand = ('<div class="brand"><p class="lbl" style="color:var(--text);'
+             'letter-spacing:2.4px">Toddler TV</p></div>')
+    parts = [brand, _flash(message)]
+
+    if status:
+        parts += [_hero_manual(status, pause),
+                  f'<section class="stack" aria-label="Switch scene"><p class="lbl">Or switch to…</p>'
+                  f'{_scene_buttons(status["scene"], "chips")}</section>',
+                  f'<section class="stack" aria-label="Channels"><p class="lbl">Channels</p>'
+                  f"{_channel_chips()}</section>"]
+    elif tv and tv.get("state") == "power_off":
+        parts += [_hero_power_off(),
+                  f'<section class="stack" aria-label="Channels"><p class="lbl">Channels</p>'
+                  f"{_channel_rows(tv)}</section>"]
+    elif period:
+        later = [p for p in todays_periods() if p[0] > _now_minutes()]
+        later_rows = "".join(
+            f'<li><div class="row"><span class="main"><span class="t" style="font-family:var(--mono)">'
+            f'{_hm(s // 60, s % 60)}–{_hm(e // 60, e % 60)}</span>'
+            f'<span class="s">{_esc(_scene_name(sc))}</span></span></div></li>'
+            for s, e, sc in later
+        )
+        parts += [_hero_scheduled(period),
+                  f'<section class="stack" aria-label="Switch scene"><p class="lbl">'
+                  f"Show a different scene</p>{_scene_buttons(period['scene'], 'chips')}</section>"]
+        if later_rows:
+            parts.append(f'<section class="stack" aria-label="Later today"><p class="lbl">Later today</p>'
+                         f'<ul class="list">{later_rows}</ul></section>')
+    else:
+        if tv is None:
+            parts.append(_offline())
+        else:
+            parts.append(_hero_playing(tv))
+        if pause:
+            next_line = ('<p class="note">Schedules are paused — the TV stays on. '
+                         '<a href="/schedule">Resume</a></p>')
+        else:
+            nxt = next_off_period()
+            next_line = (
+                f'<p class="note">Next on the schedule: <b>{_esc(_scene_name(nxt["scene"]))}, '
+                f'{_hm(nxt["start_h"], nxt["start_m"])}–{_hm(nxt["end_h"], nxt["end_m"])}</b>'
+                f' · <a href="/schedule">Schedule</a></p>'
+                if nxt else
+                '<p class="note">No more breaks today · <a href="/schedule">Schedule</a></p>'
+            )
+        parts += [f'<section class="stack" aria-label="Turn the TV off"><p class="lbl">'
+                  f"Turn the TV off for…</p>{_scene_buttons(None, 'tiles')}{next_line}</section>",
+                  f'<section class="stack" aria-label="Channels"><p class="lbl">Channels</p>'
+                  f"{_channel_rows(tv)}</section>"]
+
+    return _shell("Now", "now", "".join(parts))
 
 
 # ─────────────────────────────────────────────
-#  CHANNEL PLAYLIST PAGE
+#  CHANNEL PAGES
 # ─────────────────────────────────────────────
+
+def _channel_header(ch_idx: int, sub: str, count: int | None, is_active: bool | None) -> str:
+    """Channel switcher, title line and the Playing / Library / Settings tabs."""
+    target = {"": "", "add": "", "removed": "/library"}.get(sub, f"/{sub}")
+    switch = ""
+    for i, ch in enumerate(CHANNELS):
+        color = _safe_color(ch.get("color"))
+        border = f' style="border-color:{color}"' if i == ch_idx else ""
+        switch += (f'<a class="sw" href="/ch/{i + 1}{target}"{_current(i == ch_idx)}{border}>'
+                   f'<span class="sq" style="background:{color}"></span>'
+                   f"<span>{_esc(_channel_name(i))}</span></a>")
+    n = ch_idx + 1
+    facts = [f"Channel {n}"]
+    if count is not None:
+        facts.append(f"{count} video{'' if count == 1 else 's'}")
+    if is_active is True:
+        facts.append('<span style="color:var(--green)">on screen now</span>')
+    elif is_active is None:
+        facts.append("TV app offline")
+    tabs = [("", "Playing"), ("library", "Library"), ("settings", "Settings")]
+    current = {"add": "", "removed": "library"}.get(sub, sub)
+    seg = "".join(
+        f'<a href="/ch/{n}{"/" + key if key else ""}"{_current(key == current)}>{label}</a>'
+        for key, label in tabs
+    )
+    return (
+        f'<nav class="switch" aria-label="Channels">{switch}</nav>'
+        f'<div class="stack" style="gap:4px"><h1>{_esc(_channel_name(ch_idx))}</h1>'
+        f'<p class="note dim">{_DOT.join(facts)}</p></div>'
+        f'<nav class="seg" aria-label="Channel pages">{seg}</nav>'
+    )
+
+
+def _feed_status(item: dict) -> str:
+    if item.get("injected"):
+        return "Plays once · added from the remote"
+    if item.get("downloaded"):
+        return "Downloaded"
+    if item.get("downloading"):
+        return "Downloading"
+    return "Streams from YouTube"
+
 
 def _feed_row(n: int, item: dict, num: int) -> str:
-    """One Up Next row.  Actions are spelled out rather than bare icons."""
+    """One Up Next row; tapping it reveals its actions (details/summary, no JS)."""
     title = _esc(item.get("title") or "Unknown")
     pos = int(item.get("pos", -1))
-
-    if item.get("injected"):
-        tag = '<span class="tag once">ONCE</span>'
-    elif item.get("downloaded"):
-        tag = '<span class="tag ok">SAVED</span>'
-    elif item.get("downloading"):
-        tag = '<span class="tag dl">GETTING</span>'
-    else:
-        tag = '<span class="tag">STREAM</span>'
-
+    once = " once" if item.get("injected") else ""
     return (
-        f"<li>"
-        f'<form method="POST" action="/ch/{n}" class="qrow">'
-        f'<input type="hidden" name="csrf" value="{_CSRF_TOKEN}">'
+        f'<li class="qitem{once}"><details class="more">'
+        f'<summary class="row"><span class="main"><span class="t">{title}</span>'
+        f'<span class="s">{_esc(_feed_status(item))}</span></span>'
+        f'<span class="dots">{_DOTS}<span class="sr">Options</span></span></summary>'
+        f'<form method="POST" action="/ch/{n}" class="menu">{_csrf_field()}'
         f'<input type="hidden" name="pos" value="{pos}">'
-        f'<span class="qnum">{num}</span>'
-        f'<span class="qtitle">{title}</span>'
-        f"{tag}"
-        f'<button type="submit" name="action" value="remove" class="btn btn-sm">'
-        f"Skip</button>"
-        f'<button type="submit" name="action" value="remove_perm" '
-        f'class="btn btn-sm btn-danger">Remove</button>'
-        f"</form></li>"
+        f'<button type="submit" name="action" value="remove" class="btn btn-sm" style="flex:1">'
+        f"Not this round</button>"
+        f'<button type="submit" name="action" value="remove_perm" class="btn btn-sm btn-danger" '
+        f'style="flex:1">Remove</button></form>'
+        f"</details></li>"
     )
-
-
-def _library_strip(lib: dict | None, n: int, feed_size: int,
-                   action: str = "") -> str:
-    """Download / sync status, plus the manual sync button."""
-    action = action or f"/ch/{n}"
-    lib = lib or {}
-    pending = int(lib.get("pending") or 0)
-    current = lib.get("current")
-
-    if current:
-        downloads = f"downloading, {pending + 1} left"
-    elif pending:
-        downloads = f"{pending} waiting to download"
-    else:
-        downloads = "all downloaded"
-
-    last = lib.get("last_refresh") or ""
-    summary = lib.get("summary") or ""
-    if lib.get("refreshing"):
-        synced = "syncing right now\u2026"
-    elif last:
-        synced = f"last synced {last}" + (f" ({summary})" if summary else "")
-    else:
-        synced = "not synced yet"
-
-    return (
-        '<div class="card" style="--accent:var(--border2)">'
-        f'<p class="lib"><b>{feed_size}</b> videos on this channel<br>'
-        f"{_esc(downloads)}<br>{_esc(synced)}</p>"
-        f'<form method="POST" action="{action}">'
-        f'<input type="hidden" name="csrf" value="{_CSRF_TOKEN}">'
-        '<button type="submit" name="action" value="refresh" class="btn">'
-        '<span aria-hidden="true">\u27f3</span> Check YouTube playlists for new videos'
-        "</button></form></div>"
-    )
-
-
-def _subtabs(n: int, active: str) -> str:
-    """Second-level tabs for one channel's pages."""
-    items = [("", "Now playing"), ("videos", "Videos"), ("ignored", "Ignored"),
-             ("sources", "YouTube playlists"), ("settings", "Settings")]
-    links = []
-    for sub, label in items:
-        href = f"/ch/{n}/{sub}" if sub else f"/ch/{n}"
-        current = ' aria-current="page"' if sub == active else ""
-        links.append(f'<a href="{href}"{current}>{label}</a>')
-    return f'<nav class="subtabs" aria-label="Channel pages">{"".join(links)}</nav>'
-
-
-def _channel_shell(ch_idx: int, sub: str, body: str, is_active: bool | None) -> str:
-    """Chrome shared by every /ch/N page.  is_active=None means app offline."""
-    ch = CHANNELS[ch_idx]
-    name = _esc(ch.get("name", f"Channel {ch_idx + 1}"))
-    color = _safe_color(ch.get("color"))
-    n = ch_idx + 1
-    body = (f'<div style="--accent:{color}">{_subtabs(n, sub)}</div>' + body)
-    if is_active is None:
-        return _shell(f"{name} \u2014 Toddler TV Remote", f"ch{n}", body,
-                      where="offline", css=_PAGE_CSS)
-    bar = (
-        f'<span class="info"><span class="dot{"" if is_active else " idle"}">'
-        f"</span>{name} \u00b7 "
-        f'{"on screen now" if is_active else "in the background"}</span>'
-    )
-    return _shell(f"{name} \u2014 Toddler TV Remote", f"ch{n}", body,
-                  where=f"CH {n}", bar=bar, css=_PAGE_CSS)
-
-
-def _offline_body(message: str) -> str:
-    return (
-        _flash(message)
-        + '<div class="empty">'
-        '<span class="ico" aria-hidden="true">\U0001f4f4</span>'
-        "The TV app is not running.<br>"
-        "Start it to manage this channel.</div>"
-    )
-
-
-def _status_tag(item: dict) -> str:
-    if item.get("downloaded"):
-        return '<span class="tag ok">SAVED</span>'
-    if item.get("downloading"):
-        return '<span class="tag dl">GETTING</span>'
-    return '<span class="tag">STREAM</span>'
-
-
-def _catalog_row(n: int, sub: str, item: dict, action: str, label: str,
-                 btn_class: str) -> str:
-    """One video in the Videos / Ignored lists, keyed by video ID."""
-    vid = _esc(str(item.get("id") or ""))
-    title = _esc(item.get("title") or vid)
-    origin = _esc(item.get("from") or "")
-    return (
-        "<li>"
-        f'<form method="POST" action="/ch/{n}/{sub}" class="qrow">'
-        f'<input type="hidden" name="csrf" value="{_CSRF_TOKEN}">'
-        f'<input type="hidden" name="video" value="{vid}">'
-        f'<span class="qmain"><span class="qtitle">{title}</span>'
-        f'<span class="qfrom">from {origin}</span></span>'
-        f"{_status_tag(item)}"
-        f'<button type="submit" name="action" value="{action}" '
-        f'class="btn btn-sm {btn_class}">{label}</button>'
-        "</form></li>"
-    )
-
-
-def _build_videos_page(ch_idx: int, catalog: dict | None, message: str = "",
-                       is_active: bool | None = None) -> str:
-    n = ch_idx + 1
-    if catalog is None:
-        return _channel_shell(ch_idx, "videos", _offline_body(message), None)
-    videos = catalog.get("videos") or []
-    if videos:
-        rows = "".join(_catalog_row(n, "videos", v, "ignore", "Remove", "btn-danger")
-                       for v in videos)
-        listing = f'<ul class="queue">{rows}</ul>'
-    else:
-        listing = ('<div class="empty">No videos yet \u2014 add a YouTube playlist '
-                   f'under <a href="/ch/{n}/sources">YouTube playlists</a>, or add a '
-                   f'video on <a href="/ch/{n}">Now playing</a>.</div>')
-    body = (
-        f"{_flash(message)}"
-        f'<h2 class="section">Videos on this channel ({len(videos)})</h2>'
-        f"{listing}"
-        '<p class="note"><b>Remove</b> takes a video off this channel and deletes '
-        "its download. It moves to <b>Ignored</b>, so a YouTube playlist won't "
-        "add it back, and you can restore it from there.</p>"
-    )
-    return _channel_shell(ch_idx, "videos", body, is_active)
-
-
-def _build_ignored_page(ch_idx: int, catalog: dict | None, message: str = "",
-                        is_active: bool | None = None) -> str:
-    n = ch_idx + 1
-    if catalog is None:
-        return _channel_shell(ch_idx, "ignored", _offline_body(message), None)
-    ignored = catalog.get("ignored") or []
-    if ignored:
-        rows = "".join(_catalog_row(n, "ignored", v, "restore", "Restore", "")
-                       for v in ignored)
-        listing = f'<ul class="queue">{rows}</ul>'
-    else:
-        listing = '<div class="empty">Nothing ignored on this channel.</div>'
-    body = (
-        f"{_flash(message)}"
-        f'<h2 class="section">Ignored videos ({len(ignored)})</h2>'
-        f"{listing}"
-        '<p class="note">Videos removed from this channel. They stay off it even '
-        "if they are still in a YouTube playlist. <b>Restore</b> puts one back "
-        "on the channel, plays it next and downloads it again.</p>"
-    )
-    return _channel_shell(ch_idx, "ignored", body, is_active)
-
-
-def _source_card(n: int, src: dict) -> str:
-    pid = _esc(str(src.get("playlist_id") or ""))
-    title = _esc(src.get("title") or pid)
-    synced = src.get("last_sync") or ""
-    detail = (f"last checked {_esc(synced)} \u00b7 {int(src.get('last_count') or 0)} "
-              "videos in the playlist" if synced else "not checked yet")
-    return (
-        '<div class="card" style="--accent:var(--border2)">'
-        f'<p class="lib"><b>{title}</b><br>{detail}</p>'
-        f'<form method="POST" action="/ch/{n}/sources">'
-        f'<input type="hidden" name="csrf" value="{_CSRF_TOKEN}">'
-        f'<input type="hidden" name="playlist" value="{pid}">'
-        '<button type="submit" name="action" value="remove_source" '
-        'class="btn btn-danger">Stop using this playlist</button>'
-        "</form></div>"
-    )
-
-
-def _build_sources_page(ch_idx: int, catalog: dict | None, message: str = "",
-                        is_active: bool | None = None,
-                        lib: dict | None = None) -> str:
-    n = ch_idx + 1
-    if catalog is None:
-        return _channel_shell(ch_idx, "sources", _offline_body(message), None)
-    sources = catalog.get("sources") or []
-    cards = "".join(_source_card(n, s) for s in sources) or (
-        '<div class="empty">No YouTube playlists yet.</div>')
-    color = _safe_color(CHANNELS[ch_idx].get("color"))
-    body = (
-        f"{_flash(message)}"
-        f'<h2 class="section">YouTube playlists ({len(sources)})</h2>'
-        '<p class="note" style="margin:0 2px 14px">New videos added to these '
-        "playlists on YouTube are added to this channel automatically. Taking a "
-        "video out of a playlist on YouTube does not remove it here.</p>"
-        f"{cards}"
-        f'<h2 class="section">Add a YouTube playlist</h2>'
-        f'<form method="POST" action="/ch/{n}/sources">'
-        f'<input type="hidden" name="csrf" value="{_CSRF_TOKEN}">'
-        f'<label class="field"><span class="lab">Playlist link</span>'
-        f'<input type="text" name="playlist" inputmode="url" autocomplete="off" '
-        f'spellcheck="false" placeholder="https://youtube.com/playlist?list=\u2026">'
-        f"</label>"
-        f'<button type="submit" name="action" value="add_source" '
-        f'class="btn btn-accent" style="--accent:{color}">'
-        f'<span aria-hidden="true">+</span> Add playlist</button>'
-        '<p class="note">Its videos are added to the channel straight away, '
-        "except any you have ignored.</p></form>"
-        f'<h2 class="section">Sync</h2>'
-        f'{_library_strip(lib, n, len(catalog.get("videos") or []), f"/ch/{n}/sources")}'
-    )
-    return _channel_shell(ch_idx, "sources", body, is_active)
-
-
-def _build_settings_page(ch_idx: int, message: str = "",
-                         is_active: bool | None = None) -> str:
-    n = ch_idx + 1
-    ch = CHANNELS[ch_idx]
-    name = _esc(ch.get("name", f"Channel {n}"))
-    emoji = _esc(ch.get("emoji", "\U0001f4fa"))
-    color = _safe_color(ch.get("color"))
-    # <input type=color> only takes #rrggbb.
-    picker = color if len(color) == 7 else "#00ff88"
-
-    options = "".join(
-        f'<option value="{i + 1}">{_esc(other.get("emoji", ""))} '
-        f'{_esc(other.get("name", f"Channel {i + 1}"))}</option>'
-        for i, other in enumerate(CHANNELS) if i != ch_idx
-    )
-    body = (
-        f"{_flash(message)}"
-        f'<h2 class="section">Channel button</h2>'
-        f'<form method="POST" action="/ch/{n}/settings" class="card" '
-        f'style="--accent:{color}">'
-        f'<input type="hidden" name="csrf" value="{_CSRF_TOKEN}">'
-        f'<label class="field"><span class="lab">Name</span>'
-        f'<input type="text" name="name" value="{name}" maxlength="40" required>'
-        f"</label>"
-        f'<label class="field"><span class="lab">Emoji</span>'
-        f'<input type="text" name="emoji" value="{emoji}" maxlength="8"></label>'
-        f'<label class="field"><span class="lab">Colour</span>'
-        f'<input type="color" name="color" value="{picker}"></label>'
-        f'<button type="submit" name="action" value="save_channel" '
-        f'class="btn btn-primary">Save</button>'
-        f"</form>"
-        f'<h2 class="section">Merge into another channel</h2>'
-        f'<form method="POST" action="/ch/{n}/settings" class="card" '
-        f'style="--accent:var(--red)">'
-        f'<input type="hidden" name="csrf" value="{_CSRF_TOKEN}">'
-        f'<p class="note" style="margin:0 0 12px">Moves every video, ignored '
-        f"video and YouTube playlist from <b>{name}</b> into the channel you pick. "
-        f"Nothing is deleted. {name} is left empty, ready to rename and fill "
-        f"with new playlists.</p>"
-        f'<label class="field"><span class="lab">Move everything into</span>'
-        f'<select name="target">{options}</select></label>'
-        f'<label class="confirm"><input type="checkbox" name="confirm" value="1" '
-        f"required>I understand {name} will be left empty</label>"
-        f'<button type="submit" name="action" value="merge" class="btn btn-danger">'
-        f"Merge channel</button>"
-        f"</form>"
-    )
-    return _channel_shell(ch_idx, "settings", body, is_active)
 
 
 def _build_channel_page(ch_idx: int, info: dict | None, message: str = "",
                         lib: dict | None = None) -> str:
-    ch = CHANNELS[ch_idx]
-    color = _safe_color(ch.get("color"))
+    """/ch/<n> — what's playing and what's next."""
     n = ch_idx + 1
-
+    color = _safe_color(CHANNELS[ch_idx].get("color"))
     if not info:
-        return _channel_shell(ch_idx, "", _offline_body(message), None)
+        body = _channel_header(ch_idx, "", None, None) + _flash(message) + _offline()
+        return _shell(_channel_name(ch_idx), "channels", body)
 
-    # ── Now playing ──────────────────────────────────────────────────
+    parts = [_channel_header(ch_idx, "", int(info.get("feed_size") or 0),
+                             bool(info.get("is_active"))), _flash(message)]
+
     cur = info.get("current")
     if cur:
-        title = _esc(cur.get("title") or "Unknown")
-        uploader = _esc(cur.get("channel") or "")
         pct = min(100, max(0, int((cur.get("progress") or 0.0) * 100)))
         cur_pos = int(cur.get("pos", -1))
-        now_html = (
-            f'<form method="POST" action="/ch/{n}">'
-            f'<input type="hidden" name="csrf" value="{_CSRF_TOKEN}">'
+        parts.append(
+            f'<section class="card" aria-label="Now playing"><p class="lbl">Now playing</p>'
+            f'<p style="margin:0;font-size:17px;font-weight:700">{_esc(cur.get("title") or "Unknown")}</p>'
+            f'<div class="track" role="img" aria-label="{pct}% watched">'
+            f'<span style="width:{pct}%;background:{color}"></span></div>'
+            f'<form method="POST" action="/ch/{n}" class="btn-row">{_csrf_field()}'
             f'<input type="hidden" name="pos" value="{cur_pos}">'
-            f'<div class="np" style="--accent:{color}">'
-            f'<p class="np-title">{title}</p>'
-            + (f'<p class="np-sub">{uploader}</p>' if uploader else "")
-            + f'<div class="track"><span style="width:{pct}%"></span></div>'
-            f'<p class="pct">{pct}% watched</p>'
-            f'<div class="btn-row">'
-            f'<button type="submit" name="action" value="skip" class="btn">'
-            f'<span aria-hidden="true">\u23ed</span> Skip</button>'
-            f'<button type="submit" name="action" value="remove_perm" '
-            f'class="btn btn-danger">'
-            f'<span aria-hidden="true">\U0001f5d1</span> Remove</button>'
-            f"</div></div></form>"
+            f'<button type="submit" name="action" value="skip" class="btn">{_icon(_I_SKIP, 18)}Skip</button>'
+            f'<button type="submit" name="action" value="remove_perm" class="btn btn-danger">'
+            f"Remove</button></form></section>"
         )
+    elif not info.get("feed_size"):
+        parts.append(f'<div class="empty">No videos on this channel yet.<br>'
+                     f'Add a YouTube playlist in <a href="/ch/{n}/settings">Settings</a>, '
+                     f"or add a video below.</div>")
     else:
-        now_html = ('<div class="empty">Nothing playing yet \u2014 '
-                    "this channel is still loading\u2026</div>")
+        parts.append('<div class="empty">Nothing playing yet — this channel is still loading…</div>')
 
-    # ── Up next ──────────────────────────────────────────────────────
-    queue = info.get("queue", [])
+    queue = info.get("queue") or []
     if queue:
         rows = "".join(_feed_row(n, item, i + 1) for i, item in enumerate(queue))
-        queue_html = (
-            f'<ul class="queue">{rows}</ul>'
-            '<p class="legend">'
-            "<span><b>Skip</b> \u2014 just this time round</span>"
-            "<span><b>Remove</b> \u2014 move to Ignored and delete the download</span>"
-            "</p>"
-            '<p class="legend">'
-            "<span><b>SAVED</b> downloaded</span>"
-            "<span><b>GETTING</b> downloading</span>"
-            "<span><b>STREAM</b> plays from YouTube</span>"
-            "<span><b>ONCE</b> plays once only</span>"
-            "</p>"
-        )
-    else:
-        queue_html = '<div class="empty">Nothing queued up yet.</div>'
+        parts.append(f'<section class="stack" aria-label="Up next"><div class="brand">'
+                     f'<p class="lbl">Up next</p><p class="note dim" style="font-size:12px">shuffled</p></div>'
+                     f'<ol class="list">{rows}</ol></section>')
 
-    # ── Add a video ──────────────────────────────────────────────────
-    add_html = (
-        f'<form method="POST" action="/ch/{n}">'
-        f'<input type="hidden" name="csrf" value="{_CSRF_TOKEN}">'
-        f'<label class="field"><span class="lab">YouTube link</span>'
-        f'<input type="text" name="url" inputmode="url" autocomplete="off" '
-        f'spellcheck="false" placeholder="https://youtube.com/watch?v=\u2026">'
-        f"</label>"
-        f'<div class="choice">'
-        f'<button type="submit" name="action" value="add" class="btn btn-accent" '
-        f'style="--accent:{color}">'
-        f'<span aria-hidden="true">+</span> Add to this channel</button>'
-        f'<p class="note">Downloads it and keeps it in the rotation for good.</p>'
-        f"</div>"
-        f'<div class="choice">'
-        f'<button type="submit" name="action" value="queue" class="btn">'
-        f'<span aria-hidden="true">\u25b6</span> Play once, then forget</button>'
-        f'<p class="note">Plays straight after the current video. Nothing is '
-        f"downloaded or saved.</p>"
-        f"</div></form>"
+    pinned = (f'<a class="btn btn-main" href="/ch/{n}/add">'
+              f"{_icon(_I_PLUS, 20, width=2.4)}Add a video</a>")
+    return _shell(_channel_name(ch_idx), "channels", "".join(parts), pinned)
+
+
+def _build_add_page(ch_idx: int, message: str = "", url_value: str = "",
+                    keep: bool = False) -> str:
+    """/ch/<n>/add — one question: just this once, or keep it?"""
+    n = ch_idx + 1
+    body = (
+        f'<a class="chan" href="/ch/{n}" style="font-size:15px;min-height:44px">'
+        f"{_icon(_I_BACK, 20)}{_esc(_channel_name(ch_idx))}</a>"
+        f"<h1>Add a video</h1>{_flash(message)}"
+        f'<form method="POST" action="/ch/{n}/add" class="stack" style="gap:22px">{_csrf_field()}'
+        f'<label class="field"><span class="lbl">YouTube link</span>'
+        f'<input class="in" type="url" name="url" inputmode="url" autocomplete="off" spellcheck="false" '
+        f'required placeholder="https://youtu.be/…" value="{_esc(url_value)}">'
+        f'<span class="note dim">Share a video from the YouTube app and paste the link here.</span></label>'
+        f'<fieldset class="stack"><legend class="lbl">How long should it stay?</legend>'
+        f'<label class="opt"><input type="radio" name="keep" value="once"{"" if keep else " checked"}>'
+        f'<span><b>Just this once</b><span class="note">Plays after the current video, then it’s '
+        f"gone. Nothing is downloaded.</span></span></label>"
+        f'<label class="opt"><input type="radio" name="keep" value="keep"{" checked" if keep else ""}>'
+        f'<span><b>Keep it on this channel</b><span class="note">Plays next, downloads in the '
+        f"background, and stays in the shuffle.</span></span></label></fieldset>"
+        f'<button type="submit" name="action" value="add_video" class="btn btn-main">Play next</button>'
+        f"</form>"
     )
+    return _shell(f"Add a video — {_channel_name(ch_idx)}", "channels", body)
+
+
+def _library_url(n: int, show: str, page: int) -> str:
+    query = []
+    if show:
+        query.append(f"show={quote(show)}")
+    if page > 1:
+        query.append(f"page={page}")
+    return f"/ch/{n}/library" + ("?" + "&".join(query) if query else "")
+
+
+def _library_row(n: int, item: dict, action: str, label: str, form_url: str) -> str:
+    vid = _esc(str(item.get("id") or ""))
+    title = _esc(item.get("title") or vid)
+    origin = item.get("from") or ""
+    if origin == "added by hand":
+        origin = "Added by you"
+    elif origin and origin != "a removed playlist":
+        origin = f"{origin} playlist"
+    else:
+        origin = "From a removed playlist"
+    if item.get("downloaded"):
+        state = "downloaded"
+    elif item.get("downloading"):
+        state = '<span style="color:var(--amber)">downloading</span>'
+    else:
+        state = "streams"
+    btn_cls = "btn btn-sm btn-ghost" if action == "ignore" else "btn btn-sm"
+    return (
+        f'<li><form method="POST" action="{_esc(form_url)}" class="row">{_csrf_field()}'
+        f'<input type="hidden" name="video" value="{vid}">'
+        f'<span class="main"><span class="t">{title}</span>'
+        f'<span class="s">{_esc(origin)} · {state}</span></span>'
+        f'<button type="submit" name="action" value="{action}" class="{btn_cls}">{label}</button>'
+        f"</form></li>"
+    )
+
+
+def _build_library_page(ch_idx: int, catalog: dict | None, message: str = "",
+                        is_active: bool | None = None, show: str = "",
+                        page: int = 1) -> str:
+    """/ch/<n>/library — everything on the channel, or what was removed."""
+    n = ch_idx + 1
+    if catalog is None:
+        body = _channel_header(ch_idx, "library", None, None) + _flash(message) + _offline()
+        return _shell(f"Library — {_channel_name(ch_idx)}", "channels", body)
+
+    videos = catalog.get("videos") or []
+    removed = catalog.get("ignored") or []
+    items = removed if show == "removed" else videos
+    pages = max(1, -(-len(items) // PAGE_SIZE))
+    page = min(page, pages)
+    chunk = items[(page - 1) * PAGE_SIZE: page * PAGE_SIZE]
+    form_url = _library_url(n, show, page)
+
+    pills = (
+        f'<nav class="pills" aria-label="Filter">'
+        f'<a class="pill" href="{_library_url(n, "", 1)}"{_current(not show)}>'
+        f"On the channel · {len(videos)}</a>"
+        f'<a class="pill" href="{_library_url(n, "removed", 1)}"{_current(bool(show))}>'
+        f"Removed · {len(removed)}</a></nav>"
+    )
+    if chunk:
+        if show == "removed":
+            rows = "".join(_library_row(n, v, "restore", "Restore", form_url) for v in chunk)
+            hint = ('<p class="note dim">Removed videos stay off the channel, even if they are still '
+                    "in a YouTube playlist. Restore puts one back and plays it next.</p>")
+        else:
+            rows = "".join(_library_row(n, v, "ignore", "Remove", form_url) for v in chunk)
+            hint = ('<p class="note dim">Remove takes a video off this channel and deletes its '
+                    "download. You can restore it from Removed.</p>")
+        listing = f'<ul class="list">{rows}</ul>{hint}'
+    elif show == "removed":
+        listing = '<div class="empty">Nothing removed from this channel.</div>'
+    else:
+        listing = (f'<div class="empty">No videos yet — add a YouTube playlist in '
+                   f'<a href="/ch/{n}/settings">Settings</a>.</div>')
+
+    pager = ""
+    if pages > 1:
+        prev = (f'<a href="{_library_url(n, show, page - 1)}">Previous</a> · ' if page > 1 else "")
+        nxt = (f' · <a href="{_library_url(n, show, page + 1)}">Next page</a>' if page < pages else "")
+        pager = f'<p class="note dim">{prev}Page {page} of {pages}{nxt}</p>'
+
+    sources = catalog.get("sources") or []
+    if sources:
+        feed_head = f"Fed by {len(sources)} YouTube playlist{'' if len(sources) == 1 else 's'}"
+        feed_sub = "New videos are added automatically"
+    else:
+        feed_head = "No YouTube playlists yet"
+        feed_sub = "Add one to fill this channel automatically"
+    feed_card = (
+        f'<a class="linkcard" href="/ch/{n}/settings">{_icon(_I_SYNC, 22, "var(--dim)")}'
+        f'<span style="flex:1;display:flex;flex-direction:column">'
+        f'<span style="font-weight:600;font-size:14px">{feed_head}</span>'
+        f'<span class="note dim" style="font-size:12px">{feed_sub}</span></span>'
+        f"{_icon(_I_NEXT, 18, 'var(--dim)')}</a>"
+    )
+    body = (_channel_header(ch_idx, "library", len(videos), is_active) + _flash(message)
+            + pills + listing + pager + feed_card)
+    return _shell(f"Library — {_channel_name(ch_idx)}", "channels", body)
+
+
+# Swatches offered for a channel colour; the current colour is always kept.
+_PALETTE = [("#FF6B6B", "Coral"), ("#4ECDC4", "Teal"), ("#4D96FF", "Blue"),
+            ("#FFD93D", "Sun"), ("#6BCB77", "Green"), ("#B9A6FF", "Lilac"),
+            ("#FF9F7A", "Peach"), ("#F78FD0", "Pink")]
+
+
+def _build_settings_page(ch_idx: int, catalog: dict | None = None, message: str = "",
+                         is_active: bool | None = None, lib: dict | None = None) -> str:
+    """/ch/<n>/settings — playlists, the TV button, and merge (tucked away)."""
+    n = ch_idx + 1
+    ch = CHANNELS[ch_idx]
+    name = _esc(_channel_name(ch_idx))
+    emoji = _esc(ch.get("emoji", ""))
+    color = _safe_color(ch.get("color"))
+
+    parts = [_channel_header(ch_idx, "settings",
+                             len(catalog.get("videos") or []) if catalog else None, is_active),
+             _flash(message)]
+
+    # ── YouTube playlists ────────────────────────────────────────────
+    if catalog is None:
+        parts.append(_offline())
+    else:
+        rows = ""
+        for s in catalog.get("sources") or []:
+            if s.get("last_sync"):
+                checked = (f"{int(s.get('last_count') or 0)} videos{_DOT}"
+                           f"checked {_esc(s['last_sync'][-5:])}")
+            else:
+                checked = "not checked yet"
+            rows += (
+                f'<li><form method="POST" action="/ch/{n}/settings" class="row">{_csrf_field()}'
+                f'<input type="hidden" name="playlist" value="{_esc(str(s.get("playlist_id") or ""))}">'
+                f'<span class="main"><span class="t">{_esc(s.get("title") or s.get("playlist_id") or "")}</span>'
+                f'<span class="s">{checked}</span></span>'
+                f'<button type="submit" name="action" value="remove_source" class="btn btn-sm btn-ghost">'
+                f"Stop using</button></form></li>"
+            )
+        lib = lib or {}
+        if lib.get("refreshing"):
+            synced = "Checking right now…"
+        elif lib.get("last_refresh"):
+            synced = f"Last checked {lib['last_refresh']}" + (
+                f" — {lib['summary']}" if lib.get("summary") else "")
+        else:
+            synced = "Not checked yet"
+        parts.append(
+            f'<section class="stack" aria-label="YouTube playlists"><p class="lbl">YouTube playlists</p>'
+            f'<ul class="list">{rows}'
+            f'<li><form method="POST" action="/ch/{n}/settings" class="row" style="gap:8px;padding:12px">'
+            f'{_csrf_field()}<label style="flex:1"><span class="sr">Playlist link</span>'
+            f'<input class="in" type="url" name="playlist" inputmode="url" autocomplete="off" '
+            f'spellcheck="false" required placeholder="Paste a playlist link"></label>'
+            f'<button type="submit" name="action" value="add_source" class="btn btn-main" '
+            f'style="width:auto;min-height:50px;padding:0 18px">Add</button></form></li></ul>'
+            f'<p class="note dim">New videos in these playlists join the channel automatically. '
+            f"Removing a video on YouTube doesn’t remove it here.</p>"
+            f'<form method="POST" action="/ch/{n}/settings" class="brand" style="gap:12px">{_csrf_field()}'
+            f'<span class="note dim">{_esc(synced)}</span>'
+            f'<button type="submit" name="action" value="refresh" class="btn btn-sm">'
+            f"{_icon(_I_SYNC, 16)}Check now</button></form></section>"
+        )
+
+    # ── The button on the TV ─────────────────────────────────────────
+    palette = list(_PALETTE)
+    if color.upper() not in {c for c, _ in palette}:
+        palette.insert(0, (color, "Current colour"))
+    swatches = "".join(
+        f'<label class="pick"><input type="radio" name="color" value="{c}"'
+        f'{" checked" if c.upper() == color.upper() else ""}>'
+        f'<span style="background:{c}"><span class="sr">{label}</span></span></label>'
+        for c, label in palette
+    )
+    parts.append(
+        f'<section class="stack" aria-label="Button on the TV"><p class="lbl">Button on the TV</p>'
+        f'<form method="POST" action="/ch/{n}/settings" class="card">{_csrf_field()}'
+        f'<div style="display:flex;gap:10px">'
+        f'<label class="field" style="width:76px"><span class="note">Icon</span>'
+        f'<input class="in" type="text" name="emoji" value="{emoji}" maxlength="8" '
+        f'style="text-align:center"></label>'
+        f'<label class="field" style="flex:1"><span class="note">Name</span>'
+        f'<input class="in" type="text" name="name" value="{name}" maxlength="40" required></label></div>'
+        f'<fieldset><legend class="note">Colour</legend><div class="swatches">{swatches}</div></fieldset>'
+        f'<button type="submit" name="action" value="save_channel" class="btn">Save name and colour</button>'
+        f"</form></section>"
+    )
+
+    # ── Merge — rare and drastic, so collapsed at the bottom ─────────
+    options = "".join(
+        f'<option value="{i + 1}">{_esc(_channel_name(i))}</option>'
+        for i in range(N) if i != ch_idx
+    )
+    parts.append(
+        f'<details class="danger"><summary>Merge into another channel…</summary>'
+        f'<form method="POST" action="/ch/{n}/settings" class="body">{_csrf_field()}'
+        f'<p class="note">Moves every video, removed video and YouTube playlist from <b>{name}</b> '
+        f"into the channel you pick. Nothing is deleted. {name} is left empty, ready to reuse.</p>"
+        f'<label class="field"><span class="note">Move everything into</span>'
+        f'<select class="in" name="target">{options}</select></label>'
+        f'<label style="display:flex;gap:10px;align-items:flex-start;font-size:14px">'
+        f'<input type="checkbox" name="confirm" value="1" required '
+        f'style="width:22px;height:22px;accent-color:var(--red)">'
+        f"I understand {name} will be left empty</label>"
+        f'<button type="submit" name="action" value="merge" class="btn btn-danger">Merge channel</button>'
+        f"</form></details>"
+    )
+    return _shell(f"Settings — {_channel_name(ch_idx)}", "channels", "".join(parts))
+
+
+# ─────────────────────────────────────────────
+#  SCHEDULE PAGES
+# ─────────────────────────────────────────────
+
+_DAY_SHORT = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
+_DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+_WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+
+def _days_text(days) -> str:
+    s = sorted({d for d in days if 0 <= d <= 6})
+    if not s or s == list(range(7)):
+        return "every day"
+    if s == [0, 1, 2, 3, 4]:
+        return "Mon–Fri"
+    if s == [5, 6]:
+        return "weekends"
+    return ", ".join(_DAY_NAMES[d] for d in s)
+
+
+def _normalise(p) -> tuple:
+    if len(p) >= 7:
+        return tuple(p[:7])
+    return (*p[:5], [], False)
+
+
+def _timeline(paused: bool) -> str:
+    segs = "".join(
+        f'<span style="left:{s * 100 / 1440:.2f}%;width:{(e - s) * 100 / 1440:.2f}%"></span>'
+        for s, e, _ in todays_periods()
+    )
+    now = _now_minutes()
+    desc = ", ".join(f"{_hm(s // 60, s % 60)} to {_hm(e // 60, e % 60)}"
+                     for s, e, _ in todays_periods()) or "none"
+    label = f"TV off today: {desc}" + (" (schedules paused)" if paused else "")
+    return (
+        f'<div class="timeline{" paused" if paused else ""}" role="img" aria-label="{_esc(label)}">'
+        f'{segs}<i style="left:{now * 100 / 1440:.2f}%"></i></div>'
+        f'<div class="hours" aria-hidden="true"><span>00</span><span>06</span><span>12</span>'
+        f"<span>18</span><span>24</span></div>"
+    )
+
+
+def _build_schedule_page(periods: list, message: str = "") -> str:
+    """/schedule — pause switch, today at a glance, the period list."""
+    pause = get_schedule_pause()
+    status = get_manual_status()
+    periods = [_normalise(p) for p in periods]
+
+    since = _esc(pause.get("since") or "") if pause else ""
+    sub = (f"Paused{f' since {since}' if since else ''} — the TV stays on. "
+           "Untick to bring your periods back." if pause else
+           "Keeps the TV on. Your periods stay exactly as they are.")
+    check = (
+        f'<form method="POST" action="/schedule">{_csrf_field()}'
+        f'<button type="submit" name="action" '
+        f'value="{"schedules_resume" if pause else "schedules_pause"}" class="checkbtn" '
+        f'aria-pressed="{"true" if pause else "false"}">'
+        f'<span class="box">{_icon(_I_CHECK, 18, width=3) if pause else ""}</span>'
+        f'<span style="flex:1;display:flex;flex-direction:column;gap:3px">'
+        f'<b>Pause all schedules</b><span class="note dim">{sub}</span></span></button></form>'
+    )
+    if status:
+        check += (f'<p class="note">{_esc(_scene_name(status["scene"]))} is on right now '
+                  f'— end it on the <a href="/">Now</a> tab.</p>')
+
+    rows = []
+    for i, (sh, sm, eh, em, scene, days, paused) in enumerate(periods):
+        tag = '<span class="tag">Paused</span>' if paused else '<span class="tag on">On</span>'
+        dim = ";color:var(--dim)" if paused else ""
+        rows.append(
+            f'<li><a class="row" href="/schedule/{i}">'
+            f'<span class="main"><span class="t" style="font-family:var(--mono);font-size:15px{dim}">'
+            f"{_hm(sh, sm)} – {_hm(eh, em)}</span>"
+            f'<span class="s">{_esc(_scene_name(scene))} · {_esc(_days_text(days))}</span></span>'
+            f"{tag}{_icon(_I_NEXT, 18, 'var(--dim)')}</a></li>"
+        )
+    listing = (f'<ul class="list">{"".join(rows)}</ul>' if rows else
+               '<div class="empty">No off periods yet — the TV plays all day.</div>')
+    legend = "Paused — nothing switches off" if pause else "TV off in purple"
+    add = ("" if len(periods) >= MAX_PERIODS else
+           f'<a class="btn" href="/schedule/new" style="border-style:dashed">'
+           f"{_icon(_I_PLUS, 18, width=2.4)}Add an off period</a>")
 
     body = (
-        f"{_flash(message)}"
-        f'<h2 class="section">Now playing</h2>{now_html}'
-        f'<h2 class="section">Up next ({len(queue)})</h2>{queue_html}'
-        f'<h2 class="section">Add a video</h2>{add_html}'
-        f'<h2 class="section">Library</h2>'
-        f'{_library_strip(lib, n, int(info.get("feed_size") or 0))}'
+        f"<h1>Schedule</h1>{_flash(message)}{check}"
+        f'<section class="stack" aria-label="Today"><div class="brand">'
+        f'<p class="lbl">Today · {_WEEKDAYS[datetime.now().weekday()]}</p>'
+        f'<p class="note dim" style="font-size:12px">{legend}</p></div>'
+        f"{_timeline(bool(pause))}</section>"
+        f'<section class="stack" aria-label="Off periods"><p class="lbl">Off periods</p>'
+        f"{listing}{add}</section>"
     )
-    return _channel_shell(ch_idx, "", body, bool(info.get("is_active")))
+    return _shell("Schedule", "schedule", body)
+
+
+def _build_period_page(index, period, message: str = "") -> str:
+    """/schedule/<i> or /schedule/new — one off period."""
+    if period is None:
+        sh, sm, eh, em, scene, days, paused = 12, 0, 13, 0, "lunch", [], False
+    else:
+        sh, sm, eh, em, scene, days, paused = _normalise(period)
+    target = "new" if index is None else str(index)
+    days_set = set(days) if days else set(range(7))
+
+    scenes = "".join(
+        f'<label class="pick"><input type="radio" name="scene" value="{_esc(s)}"'
+        f'{" checked" if s == scene else ""}><span>{_scene_icon(s, 20)}{_esc(_scene_name(s))}</span></label>'
+        for s in _scene_order()
+    )
+    day_chips = "".join(
+        f'<label class="pick"><input type="checkbox" name="days" value="{d}"'
+        f'{" checked" if d in days_set else ""}><span>{lab}</span></label>'
+        for d, lab in enumerate(_DAY_SHORT)
+    )
+    delete = ("" if index is None else
+              '<button type="submit" name="action" value="delete" class="btn btn-danger" '
+              'style="width:auto;padding:0 18px">Delete</button>')
+    title = "New off period" if index is None else f"{_scene_name(scene)} period"
+    body = (
+        f'<a class="chan" href="/schedule" style="font-size:15px;min-height:44px">'
+        f"{_icon(_I_BACK, 20)}Schedule</a><h1>{_esc(title)}</h1>{_flash(message)}"
+        f'<form method="POST" action="/schedule/{target}" class="stack" style="gap:20px">{_csrf_field()}'
+        f'<div style="display:flex;gap:10px;align-items:flex-end">'
+        f'<label class="field" style="flex:1"><span class="lbl">TV off from</span>'
+        f'<input class="in" type="time" name="start" value="{_hm(sh, sm)}" required></label>'
+        f'<span aria-hidden="true" class="dim" style="padding-bottom:14px">to</span>'
+        f'<label class="field" style="flex:1"><span class="lbl">Until</span>'
+        f'<input class="in" type="time" name="end" value="{_hm(eh, em)}" required></label></div>'
+        f'<fieldset><legend class="lbl">Show on the TV</legend><div class="tiles">{scenes}</div></fieldset>'
+        f'<fieldset><legend class="lbl">Days</legend><div class="days">{day_chips}</div></fieldset>'
+        f'<label style="display:flex;align-items:center;gap:12px;min-height:48px">'
+        f'<input type="checkbox" name="paused" value="1"{" checked" if paused else ""} '
+        f'style="width:22px;height:22px;accent-color:var(--green)">Pause just this period</label>'
+        f'<div class="btn-row" style="flex:0">{delete}'
+        f'<button type="submit" name="action" value="save" class="btn btn-main" style="flex:1">Save</button></div>'
+        f"</form>"
+    )
+    return _shell(title, "schedule", body)
+
+
+def _parse_period(first, params) -> tuple | str:
+    """One period from the edit form, validated; a str is an error message."""
+    try:
+        sh, sm = (int(x) for x in first("start", "").split(":")[:2])
+        eh, em = (int(x) for x in first("end", "").split(":")[:2])
+        # Clamp out-of-range values rather than reject them (CWE-755)
+        sh, sm = max(0, min(23, sh)), max(0, min(59, sm))
+        eh, em = max(0, min(23, eh)), max(0, min(59, em))
+    except (ValueError, TypeError):
+        _log.warning("Malformed time in period form — rejected")
+        return "❌ Enter a start and end time"
+    if eh * 60 + em <= sh * 60 + sm:
+        return ("❌ The end must be after the start. For an overnight break, "
+                "add two periods (e.g. 19:30–23:59 and 00:00–06:50).")
+
+    # Whitelist the scene against known keys (CWE-20)
+    scene = first("scene", "sleeping")
+    if scene not in SCENES:
+        _log.warning("Unknown scene %r in period form — defaulting", scene[:40])
+        scene = "sleeping"
+
+    days_set = set()
+    for raw in params.get("days", [])[:7]:
+        try:
+            d = int(raw)
+        except (ValueError, TypeError):
+            continue
+        if 0 <= d <= 6:
+            days_set.add(d)
+    if not days_set:
+        return "❌ Pick at least one day"
+    # All 7 days = every day, stored as an empty list
+    days = [] if days_set == set(range(7)) else sorted(days_set)
+    paused = first("paused", "") == "1"
+    return (sh, sm, eh, em, scene, days, paused)
 
 
 # ─────────────────────────────────────────────
@@ -869,14 +1285,19 @@ class _Handler(BaseHTTPRequestHandler):
     # ── Routing ───────────────────────────────────────────────────────────────
 
     def do_GET(self):
-        route = _parse_channel_route(self.path)
+        path, query = _split(self.path)
+        if path == "/":
+            self._respond(200, _build_now_page())
+            return
+        sched = _parse_schedule_route(path)
+        if sched is not None:
+            self._respond(200, self._schedule_page(sched))
+            return
+        route = _parse_channel_route(path)
         if route is not None:
-            ch_idx, sub = route
-            html = self._channel_page(ch_idx, "", sub)
-        else:
-            periods = get_periods()
-            html = _build_page(periods)
-        self._respond(200, html)
+            self._respond(200, self._channel_page(route[0], "", route[1], query))
+            return
+        self._respond(404, self._not_found())
 
     def do_POST(self):
         # ── 1. Hard-cap body size before reading (CWE-400) ───────────────────
@@ -899,122 +1320,146 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         action = first("action")
+        path, query = _split(self.path)
 
-        # ── 3. Route channel POST ─────────────────────────────────────────────
-        route = _parse_channel_route(self.path)
+        # ── 3. Route to the page the form came from ───────────────────────────
+        if path == "/":
+            self._respond(200, _build_now_page(self._handle_now(action, first)))
+            return
+        sched = _parse_schedule_route(path)
+        if sched is not None:
+            self._handle_schedule_post(sched, action, first, params)
+            return
+        route = _parse_channel_route(path)
         if route is not None:
-            self._handle_channel_post(route[0], action, first, route[1])
+            self._handle_channel_post(route[0], action, first, route[1], query)
             return
+        self._respond(404, self._not_found())
 
-        # ── 4. Hard-cap period count (CWE-400) ────────────────────────────────
-        try:
-            count = min(int(first("count", "0")), MAX_PERIODS)
-        except ValueError:
-            count = 0
+    def _not_found(self) -> str:
+        return _shell("Not found", "now",
+                      '<h1>Page not found</h1><p class="note"><a href="/">Back to Now</a></p>')
 
-        # ── 5. Parse periods with full validation ─────────────────────────────
-        _valid_scenes = set(SCENES.keys())
-        _all_days = {0, 1, 2, 3, 4, 5, 6}
-        periods = []
-        for i in range(count):
-            start = first(f"start_{i}", "00:00")
-            end   = first(f"end_{i}",   "00:00")
-            scene = first(f"scene_{i}", "sleeping")
+    # ── Now ───────────────────────────────────────────────────────────────────
 
-            # Validate and clamp time fields (CWE-755)
+    def _handle_override(self, action: str, first) -> str | None:
+        """Manual status and the schedule pause; None if not one of these."""
+        if action == "schedules_pause":
+            pause_schedules()
+            return "⏸ Schedules paused — the TV stays on until you resume"
+        if action == "schedules_resume":
+            resume_schedules()
+            return "▶ Schedules resumed"
+        if action == "status_off":
+            clear_manual_status()
+            if get_schedule_pause():
+                return "✅ Ended — schedules are paused, so the TV is back on"
+            return "✅ Back to the schedule"
+        if action == "status_on":
+            scene = first("scene", "")
+            # Reject unknowns at the gate — never fall back to some other scene
+            # for a request that switches the TV off (CWE-20).
+            if scene not in SCENES:
+                _log.warning("Unknown manual status scene %r — ignored", scene[:40])
+                return "❌ Unknown status"
+            set_manual_status(scene)
+            return f"✅ {_scene_name(scene)} is on — the schedule is paused until you end it"
+        return None
+
+    def _handle_now(self, action: str, first) -> str:
+        message = self._handle_override(action, first)
+        if message is not None:
+            return message
+        if action == "skip":
             try:
-                parts_s = start.split(":")
-                parts_e = end.split(":")
-                sh, sm = int(parts_s[0]), int(parts_s[1])
-                eh, em = int(parts_e[0]), int(parts_e[1])
-                sh, sm = max(0, min(23, sh)), max(0, min(59, sm))
-                eh, em = max(0, min(23, eh)), max(0, min(59, em))
-            except (ValueError, IndexError):
-                _log.warning("Malformed time in period %d — skipped", i)
-                continue
-
-            # Whitelist scene against known keys (CWE-20)
-            if scene not in _valid_scenes:
-                _log.warning("Unknown scene %r in period %d — defaulting", scene, i)
-                scene = "sleeping"
-
-            # Days: collect checked day values, validate each is 0–6
-            raw_days = params.get(f"days_{i}", [])
-            days_set = set()
-            for raw in raw_days:
-                try:
-                    d = int(raw)
-                    if 0 <= d <= 6:
-                        days_set.add(d)
-                except (ValueError, TypeError):
-                    pass
-            # All 7 days checked = every day → store as empty list
-            days = [] if days_set == _all_days else sorted(days_set)
-
-            # Paused: checkbox present with value "1" means paused
-            paused = first(f"paused_{i}", "") == "1"
-
-            periods.append((sh, sm, eh, em, scene, days, paused))
-
-        # ── 6. Action dispatch ────────────────────────────────────────────────
-        delete_idx = first("delete", "")
-        if delete_idx != "":
-            try:
-                idx = int(delete_idx)
+                n = int(first("ch", "0"))
             except ValueError:
-                idx = -1
-            if 0 <= idx < len(periods):
-                periods.pop(idx)
-            save_periods(periods)
-            html = _build_page(periods, "✅ Period deleted")
+                n = 0
+            # Bound the channel number (CWE-400 / CWE-20)
+            if not 1 <= n <= N:
+                return "❌ Unknown channel"
+            fn = _cb("skip")
+            if fn:
+                fn(n - 1)
+            return "⏭ Skipped to the next video"
+        return ""
+
+    # ── Schedule ──────────────────────────────────────────────────────────────
+
+    def _schedule_page(self, target, message: str = "") -> str:
+        periods = get_periods()
+        if target == "list":
+            return _build_schedule_page(periods, message)
+        if target == "new":
+            return _build_period_page(None, None, message)
+        if target >= len(periods):
+            return _build_schedule_page(periods, "❌ That period no longer exists")
+        return _build_period_page(target, periods[target], message)
+
+    def _handle_schedule_post(self, target, action: str, first, params) -> None:
+        def reply(html: str) -> None:
             self._respond(200, html)
+
+        if target == "list":
+            message = self._handle_override(action, first) or ""
+            reply(_build_schedule_page(get_periods(), message))
             return
 
-        if action == "add":
-            periods.append((12, 0, 13, 0, "lunch", [], False))
-            html = _build_page(periods)
-            self._respond(200, html)
+        periods = [_normalise(p) for p in get_periods()]
+        if target != "new" and target >= len(periods):
+            reply(_build_schedule_page(periods, "❌ That period no longer exists"))
+            return
 
-        elif action == "save":
+        if action == "delete" and target != "new":
+            periods.pop(target)
             save_periods(periods)
-            html = _build_page(periods, "✅ Schedule saved!")
-            self._respond(200, html)
+            reply(_build_schedule_page(periods, "✅ Period deleted"))
+            return
 
+        if action != "save":
+            reply(self._schedule_page(target))
+            return
+
+        parsed = _parse_period(first, params)
+        if isinstance(parsed, str):
+            reply(self._schedule_page(target, parsed))
+            return
+        if target == "new":
+            # Hard cap on the number of periods (CWE-400)
+            if len(periods) >= MAX_PERIODS:
+                reply(_build_schedule_page(periods, f"❌ At most {MAX_PERIODS} periods"))
+                return
+            periods.append(parsed)
+            message = "✅ Period added"
         else:
-            html = _build_page(periods)
-            self._respond(200, html)
+            periods[target] = parsed
+            message = "✅ Period saved"
+        save_periods(periods)
+        reply(_build_schedule_page(periods, message))
 
-    def _channel_page(self, ch_idx: int, message: str = "", sub: str = "") -> str:
+    # ── Channels ──────────────────────────────────────────────────────────────
+
+    def _channel_page(self, ch_idx: int, message: str = "", sub: str = "",
+                      query: dict | None = None) -> str:
         """Render /ch/<n>[/sub] from a fresh snapshot of app state."""
-        lib = None
-        if sub in ("", "sources"):
-            lib_fn = _cb("library")
-            if lib_fn:
-                try:
-                    lib = lib_fn()
-                except Exception:
-                    lib = None
-        if sub == "":
-            return _build_channel_page(ch_idx, _channel_info(ch_idx), message, lib)
-
+        if sub == "add":
+            return _build_add_page(ch_idx, message)
+        lib = _call("library") if sub in ("", "settings") else None
         info = _channel_info(ch_idx)
+        if sub == "":
+            return _build_channel_page(ch_idx, info, message, lib)
         is_active = bool(info.get("is_active")) if info else None
+        catalog = _call("catalog", ch_idx)
         if sub == "settings":
-            return _build_settings_page(ch_idx, message, is_active)
-
-        catalog_fn = _cb("catalog")
-        catalog = catalog_fn(ch_idx) if catalog_fn else None
-        if sub == "videos":
-            return _build_videos_page(ch_idx, catalog, message, is_active)
-        if sub == "ignored":
-            return _build_ignored_page(ch_idx, catalog, message, is_active)
-        return _build_sources_page(ch_idx, catalog, message, is_active, lib)
+            return _build_settings_page(ch_idx, catalog, message, is_active, lib)
+        show, page = _library_view(sub, query or {})
+        return _build_library_page(ch_idx, catalog, message, is_active, show, page)
 
     def _handle_channel_post(self, ch_idx: int, action: str, first,
-                             sub: str = "") -> None:
+                             sub: str = "", query: dict | None = None) -> None:
         """Handle POST requests for /ch/<n>[/sub]; re-renders the same page."""
-        def reply(message: str = "") -> None:
-            self._respond(200, self._channel_page(ch_idx, message, sub))
+        def reply(message: str = "", page: str | None = None) -> None:
+            self._respond(200, self._channel_page(ch_idx, message, page if page is not None else sub, query))
 
         # Enum-style dispatch: an unrecognised action falls through to a plain
         # re-render rather than being coerced into something (CWE-20).
@@ -1022,11 +1467,22 @@ class _Handler(BaseHTTPRequestHandler):
             fn = _cb("skip")
             if fn:
                 fn(ch_idx)
-            reply("⏭ Skipped to next video")
+            reply("⏭ Skipped to the next video")
+            return
+
+        if action == "add_video":
+            # Whitelist: only an explicit "keep" persists; anything else plays once.
+            mode = "add" if first("keep", "once") == "keep" else "queue"
+            message, ok = self._handle_channel_add(ch_idx, mode, first)
+            if ok:
+                reply(message, "")
+            else:
+                self._respond(200, _build_add_page(ch_idx, message, first("url", "")[:300],
+                                                   keep=mode == "add"))
             return
 
         if action in ("queue", "add"):
-            reply(self._handle_channel_add(ch_idx, action, first))
+            reply(self._handle_channel_add(ch_idx, action, first)[0])
             return
 
         if action in ("remove", "remove_perm"):
@@ -1053,30 +1509,30 @@ class _Handler(BaseHTTPRequestHandler):
             fn = _cb("refresh")
             started = bool(fn and fn(ch_idx))
             reply("⟳ Checking YouTube playlists… reload in a moment"
-                  if started else "⏳ A sync is already running")
+                  if started else "⏳ A check is already running")
             return
 
         reply()
 
-    def _handle_channel_add(self, ch_idx: int, action: str, first) -> str:
+    def _handle_channel_add(self, ch_idx: int, action: str, first) -> tuple[str, bool]:
         """action=add keeps the video on the channel; action=queue plays it once."""
         # Whitelist at the gate: host and video ID must both check out (CWE-20)
         cleaned = validate_youtube_url(first("url", ""))
         if cleaned is None:
-            return "❌ Invalid YouTube URL — paste a youtube.com or youtu.be link"
+            return "❌ That isn’t a YouTube video link — paste a youtube.com or youtu.be link", False
 
         if action == "add":
             fn = _cb("add")
             ok_msg = "✅ Added to the channel — playing next, downloading now"
         else:
             fn = _cb("play_next")
-            ok_msg = "✅ Playing next — this once only"
+            ok_msg = "✅ Playing next — just this once"
 
         success = bool(fn and fn(ch_idx, cleaned))
-        return ok_msg if success else "❌ Could not add that video"
+        return (ok_msg, True) if success else ("❌ Could not add that video", False)
 
     def _handle_channel_remove(self, ch_idx: int, action: str, first) -> str:
-        """Drop one feed position.  remove_perm moves it to Ignored."""
+        """Drop one feed position.  remove_perm moves it to Removed."""
         # Bound the index before it reaches the app (CWE-400 / CWE-20)
         try:
             pos = int(first("pos", "-1"))
@@ -1089,7 +1545,7 @@ class _Handler(BaseHTTPRequestHandler):
         fn = _cb("remove")
         success = bool(fn and fn(ch_idx, pos, permanent))
         if success:
-            return ("\U0001f5d1 Removed — moved to Ignored, download deleted"
+            return ("\U0001f5d1 Removed — you can restore it from the Library"
                     if permanent else "✕ Skipped for this round")
         return "❌ Could not remove that video"
 
@@ -1101,7 +1557,7 @@ class _Handler(BaseHTTPRequestHandler):
         fn = _cb(action)
         success = bool(fn and fn(ch_idx, cleaned))
         if action == "ignore":
-            return ("\U0001f5d1 Removed — moved to Ignored, download deleted"
+            return ("\U0001f5d1 Removed — you can restore it from Removed"
                     if success else "❌ Could not remove that video")
         return ("✅ Restored — playing next, downloading now"
                 if success else "❌ Could not restore that video")
@@ -1113,7 +1569,7 @@ class _Handler(BaseHTTPRequestHandler):
             # Host whitelist + ID allowlist; the URL is rebuilt from the ID (CWE-20)
             playlist_id = validate_youtube_playlist_url(raw)
             if playlist_id is None:
-                return ("❌ That isn't a YouTube playlist link — it should "
+                return ("❌ That isn’t a YouTube playlist link — it should "
                         "contain list=…")
             fn = _cb("add_source")
             if fn and fn(ch_idx, playlist_id):
@@ -1133,7 +1589,7 @@ class _Handler(BaseHTTPRequestHandler):
         color = first("color", "").strip()
         # Length and format checks at the gate; library.py cleans again (CWE-20)
         if not name or len(name) > 40 or len(emoji) > 8:
-            return "❌ Name must be 1–40 characters and the emoji at most 8"
+            return "❌ Name must be 1–40 characters and the icon at most 8"
         if not _HEX_RE.match(color):
             return "❌ Pick a colour"
         fn = _cb("save_channel")
@@ -1153,9 +1609,10 @@ class _Handler(BaseHTTPRequestHandler):
             return "❌ Pick another channel to merge into"
         fn = _cb("merge")
         if fn and fn(ch_idx, target - 1):
-            dst = CHANNELS[target - 1].get("name", f"Channel {target}")
-            return f"✅ Everything moved into {dst} — this channel is now empty"
+            return f"✅ Everything moved into {_channel_name(target - 1)} — this channel is now empty"
         return "❌ Could not merge the channels"
+
+    # ── Response plumbing ─────────────────────────────────────────────────────
 
     def _send_security_headers(self) -> None:
         """Emit hardening headers on every response (L2)."""

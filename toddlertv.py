@@ -242,6 +242,7 @@ class ToddlerTV:
             "remove_source": self._web_remove_source,
             "save_channel":  self._web_save_channel,
             "merge":     self._web_merge_channel,
+            "tv":        self._web_tv_state,
         })
 
         # Key bindings
@@ -1033,6 +1034,13 @@ class ToddlerTV:
                 AppState.PLAYING, AppState.LOADING):
             self.root.after(0, lambda: self._start_channel(src_idx))
         return True
+
+    def _web_tv_state(self) -> dict:
+        """What the TV is doing, for the remote's Now page."""
+        return {
+            "state":   self.state.name.lower(),   # booting/loading/playing/schedule_off/power_off
+            "channel": self.current_channel,
+        }
 
     def _web_catalog(self, ch_idx: int) -> dict | None:
         """Full video / ignored / source lists for the remote's library pages."""

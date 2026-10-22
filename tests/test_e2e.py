@@ -178,22 +178,22 @@ class TestWebRemoteServer(unittest.TestCase):
 
     # ── HTTP helpers ──────────────────────────────────────────────────────────
 
-    def _get(self):
+    def _get(self, path: str = "/schedule"):
         conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
-        conn.request("GET", "/")
+        conn.request("GET", path)
         resp = conn.getresponse()
         body = resp.read().decode("utf-8")
         conn.close()
         return resp.status, body
 
-    def _post(self, body: str):
+    def _post(self, body: str, path: str = "/schedule/new"):
         import web_remote as _wr
         # Inject the CSRF token unless the caller already provided one.
         if "csrf=" not in body:
             body = body + f"&csrf={_wr._CSRF_TOKEN}"
         data = body.encode("utf-8")
         conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
-        conn.request("POST", "/", data, {
+        conn.request("POST", path, data, {
             "Content-Type":   "application/x-www-form-urlencoded",
             "Content-Length": str(len(data)),
         })
@@ -216,22 +216,33 @@ class TestWebRemoteServer(unittest.TestCase):
         _, body = self._get()
         self.assertIn("08:00", body)
 
+    def test_now_page_returns_200(self):
+        status, body = self._get("/")
+        self.assertEqual(status, 200)
+        self.assertIn("Toddler TV", body)
+
+    def test_unknown_path_is_404(self):
+        status, _ = self._get("/admin")
+        self.assertEqual(status, 404)
+
+    _EVERY_DAY = "".join(f"&days={d}" for d in range(7))
+
     def test_post_save_persists_to_file(self):
-        body = "count=1&start_0=10%3A00&end_0=11%3A00&scene_0=lunch&action=save"
+        body = "start=10%3A00&end=11%3A00&scene=lunch&action=save" + self._EVERY_DAY
         status, html = self._post(body)
         self.assertEqual(status, 200)
-        self.assertIn("saved", html.lower())
+        self.assertIn("added", html.lower())
 
         _reset_schedule_cache()
         periods = get_periods()
         saved_hours = [sh for sh, *_ in periods]
         self.assertIn(10, saved_hours)
 
-    def test_post_add_returns_new_row_without_saving(self):
+    def test_new_period_form_does_not_save(self):
         save_periods([])
         _reset_schedule_cache()
 
-        status, html = self._post("count=0&action=add")
+        status, html = self._get("/schedule/new")
         self.assertEqual(status, 200)
         # Default new period starts at 12:00
         self.assertIn("12:00", html)
@@ -239,18 +250,25 @@ class TestWebRemoteServer(unittest.TestCase):
         _reset_schedule_cache()
         self.assertEqual(get_periods(), [])
 
+    def test_edit_saves_only_that_period(self):
+        save_periods([(8, 0, 9, 0, "sleeping"), (12, 0, 13, 0, "lunch")])
+        _reset_schedule_cache()
+
+        body = "start=12%3A30&end=13%3A30&scene=lunch&action=save&days=0"
+        status, _ = self._post(body, "/schedule/1")
+        self.assertEqual(status, 200)
+
+        _reset_schedule_cache()
+        periods = get_periods()
+        self.assertEqual(periods[0][:5], (8, 0, 9, 0, "sleeping"))
+        self.assertEqual(periods[1][:2], (12, 30))
+        self.assertEqual(periods[1][5], [0])
+
     def test_post_delete_removes_correct_period(self):
         save_periods([(8, 0, 9, 0, "sleeping"), (12, 0, 13, 0, "lunch")])
         _reset_schedule_cache()
 
-        # Delete index 0 (sleeping)
-        body = (
-            "count=2"
-            "&start_0=08%3A00&end_0=09%3A00&scene_0=sleeping"
-            "&start_1=12%3A00&end_1=13%3A00&scene_1=lunch"
-            "&delete=0"
-        )
-        status, _ = self._post(body)
+        status, _ = self._post("action=delete", "/schedule/0")
         self.assertEqual(status, 200)
 
         _reset_schedule_cache()
@@ -262,9 +280,10 @@ class TestWebRemoteServer(unittest.TestCase):
         save_periods([(8, 0, 9, 0, "sleeping")])
         _reset_schedule_cache()
 
-        body = "count=1&start_0=08%3A00&end_0=09%3A00&scene_0=sleeping&delete=99"
-        status, _ = self._post(body)
+        status, _ = self._post("action=delete", "/schedule/40")
         self.assertEqual(status, 200)  # must not crash
+        _reset_schedule_cache()
+        self.assertEqual(len(get_periods()), 1)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -401,6 +420,12 @@ class TestAppStateMachine(unittest.TestCase):
         # Clean shared state
         _images_module._avatar_cache.clear()
         _reset_schedule_cache()
+        # Keep the real schedule.json out of reach, or these tests turn the
+        # TV "off" whenever they happen to run during one of its periods.
+        self._sched_patcher = patch.object(
+            _schedule_module, "SCHEDULE_FILE",
+            os.path.join(tempfile.gettempdir(), "toddlertv-no-such-schedule.json"))
+        self._sched_patcher.start()
         _schedule_module._cached_periods = []   # empty = always on
         _schedule_module._cached_mtime   = 1.0
 
@@ -447,6 +472,7 @@ class TestAppStateMachine(unittest.TestCase):
         time.sleep(0.15)
         for p in self._patchers:
             p.stop()
+        self._sched_patcher.stop()
         try:
             self._root.destroy()
         except Exception:
@@ -821,6 +847,85 @@ class TestCatalogFlow(unittest.TestCase):
              patch("toddlertv.delete_local_file") as delete:
             self.assertEqual(self.app._prune_orphan_downloads(), 0)
         delete.assert_not_called()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Manual status — overrides the schedule until switched off
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestManualStatusInApp(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        import toddlertv as _tt
+        cls._tt = _tt
+
+    def setUp(self):
+        import shutil
+        self._tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._tmp, True)
+        p = patch.object(_schedule_module, "STATUS_FILE",
+                         os.path.join(self._tmp, "manual_status.json"))
+        p.start()
+        self.addCleanup(p.stop)
+        _schedule_module._cached_status, _schedule_module._cached_status_mtime = None, 0.0
+        TestAppStateMachine.setUp(self)
+        self.app.ch_badge = MagicMock()
+        self.app.state = self._tt.AppState.PLAYING
+
+    def tearDown(self):
+        _schedule_module.clear_manual_status()
+        TestAppStateMachine.tearDown(self)
+
+    def _check(self):
+        with patch.object(self.app.root, "after"):
+            self.app._check_schedule()
+
+    def test_status_turns_the_tv_off_with_its_scene(self):
+        _schedule_module.set_manual_status("tubby")
+        with patch.object(self.app, "_show_robots") as show:
+            self._check()
+        self.assertEqual(self.app.state, self._tt.AppState.SCHEDULE_OFF)
+        show.assert_called_with("tubby")
+
+    def test_ending_the_status_turns_the_tv_back_on(self):
+        _schedule_module.set_manual_status("tubby")
+        self._check()
+        _schedule_module.clear_manual_status()
+        # _start_channel is what moves the app on from SCHEDULE_OFF.
+        with patch.object(self.app, "_start_channel") as start:
+            self._check()
+        start.assert_called_once_with(self.app.current_channel)
+
+    def test_switching_scene_while_off_updates_the_screen(self):
+        _schedule_module.set_manual_status("tubby")
+        self._check()
+        _schedule_module.set_manual_status("lunch")
+        with patch.object(self.app, "_show_robots") as show:
+            self._check()
+        show.assert_called_once_with("lunch")
+
+    def test_pausing_schedules_turns_the_tv_back_on(self):
+        # Off all day.  Injected into the cache, with the real schedule.json
+        # out of reach, so the user's file is never written.
+        p = patch.object(_schedule_module, "SCHEDULE_FILE",
+                         os.path.join(self._tmp, "schedule.json"))
+        p.start()
+        self.addCleanup(p.stop)
+        _schedule_module._cached_periods = [(0, 0, 23, 59, "lunch", [], False)]
+        self.addCleanup(setattr, _schedule_module, "_cached_periods", [])
+        self._check()
+        self.assertEqual(self.app.state, self._tt.AppState.SCHEDULE_OFF)
+        _schedule_module.pause_schedules()
+        self.addCleanup(_schedule_module.resume_schedules)
+        with patch.object(self.app, "_start_channel") as start:
+            self._check()
+        start.assert_called_once_with(self.app.current_channel)
+
+    def test_power_button_off_is_left_alone(self):
+        self.app.state = self._tt.AppState.POWER_OFF
+        _schedule_module.set_manual_status("tubby")
+        self._check()
+        self.assertEqual(self.app.state, self._tt.AppState.POWER_OFF)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

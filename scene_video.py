@@ -21,7 +21,7 @@ import os
 import tkinter as tk
 
 from config import SCENES
-from schedule import next_on_time
+from schedule import back_text
 
 # ─────────────────────────────────────────────
 #  SCENE → CLIP MAPPING
@@ -276,7 +276,7 @@ class SceneVideoPlayer:
             return
 
         scene   = SCENES.get(self.scene, SCENES["sleeping"])
-        on_time = next_on_time()
+        back    = back_text()
         cx      = w // 2
 
         # Scale with the bar so the text stays inside it on any screen.
@@ -294,6 +294,6 @@ class SceneVideoPlayer:
                        fill="#00ff88", font=("Courier New", msg_pt, "bold"),
                        anchor="center")
         cv.create_text(cx, h * 0.85,
-                       text=f"{scene['sub']}  ·  back at {on_time}",
+                       text=f"{scene['sub']}  ·  {back}",
                        fill="#444466", font=("Courier New", sub_pt),
                        anchor="center")

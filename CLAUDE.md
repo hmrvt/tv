@@ -199,8 +199,8 @@ Upgrade checklist:
 
 ### 5. Secrets & Sensitive Files
 
-**`cookies.txt`, `channels.json` (and its `.bak` copies), `schedule.json`, and
-`videos/` are in `.gitignore`.  Never force-add them.**
+**`cookies.txt`, `channels.json` (and its `.bak` copies), `schedule.json`,
+`manual_status.json`, and `videos/` are in `.gitignore`.  Never force-add them.**
 
 ```bash
 # FORBIDDEN
@@ -221,7 +221,7 @@ These test files must stay green before every merge:
 
 | File | What it guards |
 |------|----------------|
-| `tests/test_security_web_remote.py` | Auth, CSRF, DoS caps (body/count/position), scene + action whitelist, pasted-URL whitelist, time parsing, logging, security headers, log injection, feed-page escaping, channel library pages (ignore/restore/sources/settings/merge) |
+| `tests/test_security_web_remote.py` | Auth, CSRF, DoS caps (body/count/position), scene + action whitelist, pasted-URL whitelist, time parsing, logging, security headers, log injection, feed-page escaping, channel library pages (ignore/restore/sources/settings/merge), manual status on/off, pause/resume schedules, per-period schedule edit (index + count caps), route whitelist / 404s, Now-page skip |
 | `tests/test_security_media.py` | Video ID allowlist, path boundary (read **and delete**), removed yt-dlp flags, `validate_youtube_url` / `validate_youtube_playlist_url` host whitelist, `downloads.py` and playlist-fetch argv hygiene |
 | `tests/test_security_dependencies.py` | All packages pinned with `==`, installed versions match pins |
 

@@ -18,6 +18,7 @@ cookies.txt
 channels.json
 channels.json.*
 schedule.json
+manual_status.json
 playlist_overlay.json
 playlist_overlay.json.*
 videos/

@@ -3,7 +3,9 @@ Security regression tests — web_remote.py
 Covers: CWE-352 (CSRF), CWE-400 (DoS body/count/position),
         CWE-20 (scene + action + URL validation), CWE-755 (time parsing),
         CWE-778 (logging), CWE-79 (video metadata in the feed page),
-        channel library pages (ignore / restore / sources / settings / merge).
+        channel library pages (ignore / restore / sources / settings / merge),
+        manual status (switch a scene on / off, overriding the schedule),
+        pause / resume all schedules.
 
 Run with:  python -m pytest tests/test_security_web_remote.py -v
 """
@@ -24,7 +26,7 @@ sys.modules.setdefault("yt_dlp", MagicMock())
 
 import web_remote as _wr
 from web_remote import (
-    _Handler, _CSRF_TOKEN, MAX_BODY, MAX_PERIODS, _build_page,
+    _Handler, _CSRF_TOKEN, MAX_BODY, MAX_PERIODS, _build_schedule_page,
 )
 
 
@@ -70,9 +72,25 @@ def _make_handler(method: str, body: bytes = b"", headers: dict | None = None) -
     return handler
 
 
+_EVERY_DAY = "".join(f"&days={d}" for d in range(7))
+
+
 def _valid_post_body(extra: str = "") -> bytes:
-    """Minimal valid POST body: correct CSRF, zero periods."""
-    return f"count=0&csrf={_CSRF_TOKEN}&action=save{extra}".encode()
+    """Minimal valid POST body for /schedule/new: correct CSRF, one period."""
+    return (f"csrf={_CSRF_TOKEN}&action=save&start=08:00&end=09:00"
+            f"&scene=sleeping{_EVERY_DAY}{extra}").encode()
+
+
+def _post_period(body: bytes, path: str = "/schedule/new", periods=None,
+                 headers: dict | None = None):
+    """POST to a period route; returns (handler, list of save_periods payloads)."""
+    h = _make_handler("POST", body, headers=headers)
+    h.path = path
+    saved = []
+    with patch("web_remote.get_periods", return_value=list(periods or [])), \
+         patch("web_remote.save_periods", side_effect=saved.append):
+        h.do_POST()
+    return h, saved
 
 
 # ─────────────────────────────────────────────
@@ -82,20 +100,15 @@ def _valid_post_body(extra: str = "") -> bytes:
 class TestCSRF(unittest.TestCase):
 
     def _post(self, body: bytes) -> _Handler:
-        h = _make_handler("POST", body)
-        with patch("web_remote.get_periods", return_value=[]), \
-             patch("web_remote.save_periods"):
-            h.do_POST()
-        return h
+        return _post_period(body)[0]
 
     def test_missing_csrf_token_returns_403(self):
-        body = b"count=0&action=save"   # no csrf field
-        h = self._post(body)
+        h, saved = _post_period(b"action=save&start=08:00&end=09:00&scene=lunch&days=0")
         h.send_response.assert_called_once_with(403)
+        self.assertEqual(saved, [])
 
     def test_wrong_csrf_token_returns_403(self):
-        body = b"count=0&csrf=deadbeefdeadbeef&action=save"
-        h = self._post(body)
+        h = self._post(b"csrf=deadbeefdeadbeef&action=save&start=08:00&end=09:00&days=0")
         h.send_response.assert_called_once_with(403)
 
     def test_correct_csrf_token_returns_200(self):
@@ -103,15 +116,24 @@ class TestCSRF(unittest.TestCase):
         h.send_response.assert_called_once_with(200)
 
     def test_empty_csrf_token_returns_403(self):
-        body = b"count=0&csrf=&action=save"
-        h = self._post(body)
+        h = self._post(b"csrf=&action=save&start=08:00&end=09:00&days=0")
         h.send_response.assert_called_once_with(403)
+
+    def test_delete_requires_csrf(self):
+        h, saved = _post_period(b"action=delete", "/schedule/0",
+                                periods=[(8, 0, 9, 0, "lunch", [], False)])
+        h.send_response.assert_called_once_with(403)
+        self.assertEqual(saved, [])
 
     def test_csrf_token_in_page_html(self):
         """The CSRF token must appear as a hidden input in the rendered page."""
-        html = _build_page([])
+        html = _build_schedule_page([])
         self.assertIn(_CSRF_TOKEN, html)
         self.assertIn('name="csrf"', html)
+
+    def test_csrf_token_in_period_form(self):
+        html = _wr._build_period_page(None, None)
+        self.assertIn(_CSRF_TOKEN, html)
 
 
 # ─────────────────────────────────────────────
@@ -122,67 +144,70 @@ class TestBodySizeCap(unittest.TestCase):
 
     def test_reads_at_most_max_body_bytes(self):
         """Even if Content-Length claims 10 MB, only MAX_BODY bytes are read."""
-        big_body = b"count=0&csrf=" + _CSRF_TOKEN.encode() + b"&action=save" + b"x" * (10 * 1024 * 1024)
-        headers = {"Content-Length": str(len(big_body))}
-        h = _make_handler("POST", big_body, headers=headers)
-        with patch("web_remote.get_periods", return_value=[]), \
-             patch("web_remote.save_periods"):
-            h.do_POST()
+        big_body = _valid_post_body() + b"&x=" + b"x" * (10 * 1024 * 1024)
+        h, _ = _post_period(big_body, headers={"Content-Length": str(len(big_body))})
         # rfile position must not exceed MAX_BODY
         self.assertLessEqual(h.rfile.tell(), MAX_BODY)
 
     def test_giant_content_length_header_does_not_crash(self):
         """A Content-Length claiming 4 GB must not cause an allocation attempt."""
-        body = _valid_post_body()
-        headers = {"Content-Length": str(4 * 1024 ** 3)}
-        h = _make_handler("POST", body, headers=headers)
-        with patch("web_remote.get_periods", return_value=[]), \
-             patch("web_remote.save_periods"):
-            start = time.monotonic()
-            h.do_POST()
-            elapsed = time.monotonic() - start
+        start = time.monotonic()
+        _post_period(_valid_post_body(), headers={"Content-Length": str(4 * 1024 ** 3)})
         # Must complete almost instantly — not hang reading gigabytes
-        self.assertLess(elapsed, 2.0)
+        self.assertLess(time.monotonic() - start, 2.0)
 
 
 # ─────────────────────────────────────────────
-#  4. DoS — Unbounded Period Count (CWE-400)
+#  4. DoS — Unbounded Period Count / Index (CWE-400)
 # ─────────────────────────────────────────────
 
 class TestPeriodCountCap(unittest.TestCase):
 
-    def _post_with_count(self, count: int) -> float:
-        body = f"count={count}&csrf={_CSRF_TOKEN}&action=save".encode()
-        h = _make_handler("POST", body)
-        with patch("web_remote.get_periods", return_value=[]), \
-             patch("web_remote.save_periods"):
-            start = time.monotonic()
-            h.do_POST()
-            return time.monotonic() - start
-
     def test_max_periods_constant_is_bounded(self):
         self.assertLessEqual(MAX_PERIODS, 48)
 
-    def test_count_of_999999_completes_quickly(self):
-        elapsed = self._post_with_count(999_999)
-        self.assertLess(elapsed, 1.0, "count DoS: handler took too long")
+    def test_adding_beyond_the_cap_is_refused(self):
+        full = [(8, 0, 9, 0, "lunch", [], False)] * MAX_PERIODS
+        h, saved = _post_period(_valid_post_body(), periods=full)
+        h.send_response.assert_called_once_with(200)
+        self.assertEqual(saved, [])
 
-    def test_count_exceeding_max_is_clamped(self):
-        """Handler must not create more than MAX_PERIODS parsed periods
-        even when count claims a higher number with real field data."""
-        # Provide MAX_PERIODS + 10 fully filled period fields
-        n = MAX_PERIODS + 10
-        fields = "".join(
-            f"&start_{i}=08:00&end_{i}=09:00&scene_{i}=lunch"
-            for i in range(n)
-        )
-        body = f"count={n}&csrf={_CSRF_TOKEN}&action=save{fields}".encode()
-        h = _make_handler("POST", body)
-        saved_calls = []
-        with patch("web_remote.save_periods", side_effect=saved_calls.append):
-            h.do_POST()
-        if saved_calls:
-            self.assertLessEqual(len(saved_calls[0]), MAX_PERIODS)
+    def test_adding_below_the_cap_saves_one_more(self):
+        _, saved = _post_period(_valid_post_body(), periods=[(8, 0, 9, 0, "lunch", [], False)])
+        self.assertEqual(len(saved[0]), 2)
+
+    def test_index_beyond_the_cap_is_not_routed(self):
+        h, saved = _post_period(_valid_post_body(), path=f"/schedule/{MAX_PERIODS}")
+        h.send_response.assert_called_once_with(404)
+        self.assertEqual(saved, [])
+
+    def test_huge_index_is_not_routed(self):
+        h, saved = _post_period(_valid_post_body(), path="/schedule/" + "9" * 5000)
+        self.assertEqual(saved, [])
+
+    def test_index_of_a_missing_period_saves_nothing(self):
+        h, saved = _post_period(_valid_post_body(), path="/schedule/5",
+                                periods=[(8, 0, 9, 0, "lunch", [], False)])
+        h.send_response.assert_called_once_with(200)
+        self.assertEqual(saved, [])
+
+    def test_delete_of_a_missing_period_saves_nothing(self):
+        _, saved = _post_period(f"csrf={_CSRF_TOKEN}&action=delete".encode(),
+                                path="/schedule/7")
+        self.assertEqual(saved, [])
+
+    def test_delete_removes_only_that_period(self):
+        periods = [(8, 0, 9, 0, "sleeping", [], False), (12, 0, 13, 0, "lunch", [], False)]
+        _, saved = _post_period(f"csrf={_CSRF_TOKEN}&action=delete".encode(),
+                                path="/schedule/0", periods=periods)
+        self.assertEqual(saved, [[(12, 0, 13, 0, "lunch", [], False)]])
+
+    def test_many_day_fields_are_capped(self):
+        """A flood of days= fields must not be iterated without bound."""
+        body = _valid_post_body("&days=1" * 2000)
+        start = time.monotonic()
+        _, saved = _post_period(body)
+        self.assertLess(time.monotonic() - start, 1.0)
 
 
 # ─────────────────────────────────────────────
@@ -192,15 +217,10 @@ class TestPeriodCountCap(unittest.TestCase):
 class TestSceneValidation(unittest.TestCase):
 
     def _parse_periods_from_post(self, scene_value: str) -> list:
-        body = (
-            f"count=1&csrf={_CSRF_TOKEN}&action=save"
-            f"&start_0=08:00&end_0=09:00&scene_0={scene_value}"
-        ).encode()
-        h = _make_handler("POST", body)
-        captured = []
-        with patch("web_remote.save_periods", side_effect=captured.append):
-            h.do_POST()
-        return captured[0] if captured else []
+        body = (f"csrf={_CSRF_TOKEN}&action=save&start=08:00&end=09:00"
+                f"&scene={scene_value}{_EVERY_DAY}").encode()
+        _, saved = _post_period(body)
+        return saved[0] if saved else []
 
     def test_valid_scene_is_accepted(self):
         periods = self._parse_periods_from_post("sleeping")
@@ -229,63 +249,60 @@ class TestSceneValidation(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────
-#  6. Time Field Validation (CWE-755)
+#  6. Time / day field validation (CWE-755)
 # ─────────────────────────────────────────────
 
 class TestTimeFieldValidation(unittest.TestCase):
 
-    def _post_time(self, start: str, end: str) -> list:
-        body = (
-            f"count=1&csrf={_CSRF_TOKEN}&action=save"
-            f"&start_0={start}&end_0={end}&scene_0=sleeping"
-        ).encode()
-        h = _make_handler("POST", body)
-        captured = []
-        with patch("web_remote.save_periods", side_effect=captured.append):
-            h.do_POST()
-        return captured[0] if captured else []
+    def _post_time(self, start: str, end: str, days: str = _EVERY_DAY) -> list:
+        body = (f"csrf={_CSRF_TOKEN}&action=save&start={start}&end={end}"
+                f"&scene=sleeping{days}").encode()
+        h, saved = _post_period(body)
+        h.send_response.assert_called_once_with(200)   # never a crash
+        return saved[0] if saved else []
 
     def test_valid_time_is_accepted(self):
         periods = self._post_time("08:00", "09:30")
         self.assertEqual(len(periods), 1)
         self.assertEqual(periods[0][:4], (8, 0, 9, 30))
 
-    def test_malformed_time_no_colon_skips_period(self):
-        """'notatime' has no colon — handler must skip, not crash."""
-        periods = self._post_time("notatime", "09:00")
-        self.assertEqual(len(periods), 0)
+    def test_malformed_time_no_colon_is_rejected(self):
+        """'notatime' has no colon — handler must reject, not crash."""
+        self.assertEqual(self._post_time("notatime", "09:00"), [])
 
-    def test_malformed_time_alpha_skips_period(self):
-        periods = self._post_time("aa:bb", "cc:dd")
-        self.assertEqual(len(periods), 0)
+    def test_malformed_time_alpha_is_rejected(self):
+        self.assertEqual(self._post_time("aa:bb", "cc:dd"), [])
 
     def test_time_out_of_range_is_clamped(self):
         """Hours > 23 or minutes > 59 must be clamped, not crash."""
-        periods = self._post_time("99:99", "25:61")
+        periods = self._post_time("05:99", "25:61")
         self.assertEqual(len(periods), 1)
         sh, sm, eh, em = periods[0][:4]
-        self.assertLessEqual(sh, 23)
-        self.assertLessEqual(sm, 59)
-        self.assertLessEqual(eh, 23)
-        self.assertLessEqual(em, 59)
+        self.assertEqual((sh, sm, eh, em), (5, 59, 23, 59))
 
-    def test_path_traversal_in_time_field_skips_period(self):
-        periods = self._post_time("../../etc", "passwd")
-        self.assertEqual(len(periods), 0)
+    def test_end_before_start_is_rejected(self):
+        self.assertEqual(self._post_time("10:00", "09:00"), [])
 
-    def test_mixed_valid_and_invalid_periods(self):
-        """Valid periods survive; malformed ones are dropped silently."""
-        body = (
-            f"count=2&csrf={_CSRF_TOKEN}&action=save"
-            f"&start_0=08:00&end_0=09:00&scene_0=sleeping"
-            f"&start_1=INVALID&end_1=INVALID&scene_1=sleeping"
-        ).encode()
-        h = _make_handler("POST", body)
-        captured = []
-        with patch("web_remote.save_periods", side_effect=captured.append):
-            h.do_POST()
-        self.assertEqual(len(captured[0]), 1)
-        self.assertEqual(captured[0][0][:4], (8, 0, 9, 0))
+    def test_path_traversal_in_time_field_is_rejected(self):
+        self.assertEqual(self._post_time("../../etc", "passwd"), [])
+
+    def test_no_days_is_rejected(self):
+        self.assertEqual(self._post_time("08:00", "09:00", days=""), [])
+
+    def test_out_of_range_days_are_dropped(self):
+        periods = self._post_time("08:00", "09:00", days="&days=1&days=9&days=-1&days=x")
+        self.assertEqual(periods[0][5], [1])
+
+    def test_every_day_is_stored_as_empty(self):
+        self.assertEqual(self._post_time("08:00", "09:00")[0][5], [])
+
+    def test_edit_keeps_the_other_periods(self):
+        periods = [(8, 0, 9, 0, "sleeping", [], False), (12, 0, 13, 0, "lunch", [], False)]
+        body = (f"csrf={_CSRF_TOKEN}&action=save&start=12:30&end=13:30"
+                f"&scene=lunch&days=0&paused=1").encode()
+        _, saved = _post_period(body, path="/schedule/1", periods=periods)
+        self.assertEqual(saved[0][0], periods[0])
+        self.assertEqual(saved[0][1], (12, 30, 13, 30, "lunch", [0], True))
 
 
 # ─────────────────────────────────────────────
@@ -305,8 +322,7 @@ class TestLogging(unittest.TestCase):
             mock_info.assert_called_once()
 
     def test_csrf_failure_logs_warning(self):
-        body = b"count=0&csrf=bad&action=save"
-        h = _make_handler("POST", body)
+        h = _make_handler("POST", b"csrf=bad&action=save")
         with patch.object(_wr._log, "warning") as mock_warn:
             h.do_POST()
             mock_warn.assert_called()
@@ -321,11 +337,9 @@ class TestLogInjection(unittest.TestCase):
     def _csrf_fail_with_peer(self, peer_ip: str) -> str:
         """Trigger a CSRF failure with a crafted client_address and capture
         the string that was actually passed to _log.warning."""
-        body = b"count=0&csrf=bad&action=save"
-        h = _make_handler("POST", body)
+        h = _make_handler("POST", b"csrf=bad&action=save")
         h.client_address = (peer_ip, 12345)
         logged_peer = []
-        real_warning = _wr._log.warning
 
         def capture(fmt, *args):
             logged_peer.append(args[0] if args else "")
@@ -368,47 +382,132 @@ class TestLogInjection(unittest.TestCase):
 
 class TestSecurityHeaders(unittest.TestCase):
 
-    def _get_headers(self, handler_method="do_GET",
-                     body=b"", extra_headers=None) -> dict:
-        """Run a handler method and collect all send_header calls."""
-        h = _make_handler("GET" if handler_method == "do_GET" else "POST",
-                          body, headers=extra_headers)
+    def _headers(self, method: str, path: str, body: bytes = b"") -> dict:
+        h = _make_handler(method, body)
+        h.path = path
         emitted = {}
         h.send_header = lambda k, v: emitted.update({k: v})
         with patch("web_remote.get_periods", return_value=[]), \
              patch("web_remote.save_periods"):
-            getattr(h, handler_method)()
+            getattr(h, "do_" + method)()
         return emitted
 
-    def test_get_response_includes_nosniff(self):
-        headers = self._get_headers("do_GET")
-        self.assertEqual(headers.get("X-Content-Type-Options"), "nosniff")
-
-    def test_get_response_denies_framing(self):
-        headers = self._get_headers("do_GET")
-        self.assertEqual(headers.get("X-Frame-Options"), "DENY")
-
-    def test_get_response_includes_csp(self):
-        headers = self._get_headers("do_GET")
-        csp = headers.get("Content-Security-Policy", "")
-        self.assertIn("script-src 'none'", csp)
-        self.assertIn("frame-ancestors 'none'", csp)
+    def test_every_page_carries_the_headers(self):
+        for path in ("/", "/schedule", "/schedule/new", "/ch/1", "/ch/1/add",
+                     "/ch/1/library", "/ch/1/settings", "/nope"):
+            headers = self._headers("GET", path)
+            self.assertEqual(headers.get("X-Content-Type-Options"), "nosniff", path)
+            self.assertEqual(headers.get("X-Frame-Options"), "DENY", path)
+            csp = headers.get("Content-Security-Policy", "")
+            self.assertIn("script-src 'none'", csp, path)
+            self.assertIn("frame-ancestors 'none'", csp, path)
 
     def test_post_response_includes_nosniff(self):
-        body = _valid_post_body()
-        headers = self._get_headers("do_POST", body=body)
+        headers = self._headers("POST", "/schedule/new", _valid_post_body())
         self.assertEqual(headers.get("X-Content-Type-Options"), "nosniff")
 
     def test_403_response_includes_security_headers(self):
         """CSRF rejection responses must also carry hardening headers."""
-        body = b"count=0&csrf=bad&action=save"
-        h = _make_handler("POST", body)
-        emitted = {}
-        h.send_header = lambda k, v: emitted.update({k: v})
+        headers = self._headers("POST", "/", b"csrf=bad&action=save")
+        self.assertIn("X-Content-Type-Options", headers)
+
+
+# ─────────────────────────────────────────────
+#  9b. Routing — whitelisted paths only (CWE-20)
+# ─────────────────────────────────────────────
+
+class TestRouting(unittest.TestCase):
+
+    def _get(self, path: str) -> _Handler:
+        h = _make_handler("GET")
+        h.path = path
+        with patch("web_remote.get_periods", return_value=[]):
+            h.do_GET()
+        return h
+
+    def test_unknown_paths_are_404(self):
+        for path in ("/admin", "/schedule/abc", "/schedule/../etc", "/ch/1/../../x",
+                     "/ch/0", "/ch/99", "/ch/1/delete"):
+            self._get(path).send_response.assert_called_once_with(404)
+
+    def test_query_string_does_not_break_routing(self):
+        self._get("/ch/1/library?show=removed&page=2").send_response.assert_called_once_with(200)
+
+    def test_old_bookmarks_still_resolve(self):
+        for path in ("/ch/1/videos", "/ch/1/ignored", "/ch/1/sources"):
+            self._get(path).send_response.assert_called_once_with(200)
+
+    def test_library_page_number_is_bounded(self):
+        show, page = _wr._library_view("library", {"page": ["999999"]})
+        self.assertEqual(page, _wr.MAX_PAGE)
+        # Past Python's int-parsing limit: rejected, falls back to page 1.
+        show, page = _wr._library_view("library", {"page": ["9" * 5000]})
+        self.assertEqual(page, 1)
+        show, page = _wr._library_view("library", {"page": ["-5"]})
+        self.assertEqual(page, 1)
+        show, page = _wr._library_view("library", {"page": ["abc"], "show": ["../x"]})
+        self.assertEqual((show, page), ("", 1))
+
+
+# ─────────────────────────────────────────────
+#  9c. Now page — skip and status from the home page
+# ─────────────────────────────────────────────
+
+class TestNowPage(unittest.TestCase):
+
+    def setUp(self):
+        self.calls = []
+        # A playing TV, whatever the real schedule / override files say.
+        for name, value in (("get_manual_status", None), ("get_schedule_pause", None),
+                            ("current_off_period", None), ("next_off_period", None),
+                            ("todays_periods", [])):
+            p = patch(f"web_remote.{name}", return_value=value)
+            p.start()
+            self.addCleanup(p.stop)
+        _wr.register_channel_callbacks({
+            "skip": lambda ch: self.calls.append(("skip", ch)),
+            "tv": lambda: {"state": "playing", "channel": 0},
+            "get": lambda ch: {"name": "C", "feed_size": 1, "is_active": ch == 0,
+                               "current": {"pos": 0, "title": "<script>x</script>",
+                                           "progress": 0.5},
+                               "queue": []},
+        })
+
+    def tearDown(self):
+        _wr.register_channel_callbacks({})
+
+    def _post(self, body: str) -> _Handler:
+        h = _make_handler("POST", body.encode())
         h.do_POST()
-        self.assertIn("X-Content-Type-Options", emitted)
+        return h
 
+    def test_skip_reaches_the_app(self):
+        self._post(f"csrf={_CSRF_TOKEN}&action=skip&ch=2")
+        self.assertEqual(self.calls, [("skip", 1)])
 
+    def test_skip_requires_csrf(self):
+        self._post("action=skip&ch=1").send_response.assert_called_once_with(403)
+        self.assertEqual(self.calls, [])
+
+    def test_skip_channel_is_bounded(self):
+        for ch in ("0", "-1", "99", "9" * 5000, "abc", ""):
+            self._post(f"csrf={_CSRF_TOKEN}&action=skip&ch={ch}")
+        self.assertEqual(self.calls, [])
+
+    def test_now_page_escapes_the_title(self):
+        h = _make_handler("GET")
+        h.do_GET()
+        html = h.wfile.getvalue().decode("utf-8")
+        self.assertNotIn("<script>x</script>", html)
+        self.assertIn("&lt;script&gt;", html)
+
+    def test_now_page_survives_a_failing_callback(self):
+        def boom(*a):
+            raise RuntimeError("app hiccup")
+        _wr.register_channel_callbacks({"tv": boom, "get": boom})
+        h = _make_handler("GET")
+        h.do_GET()
+        h.send_response.assert_called_once_with(200)
 
 
 # ─────────────────────────────────────────────
@@ -880,6 +979,153 @@ class TestLibraryEndpoints(unittest.TestCase):
         _wr.register_channel_callbacks({})
         for sub in ("videos", "ignored", "sources", "settings"):
             self.assertIn("<!DOCTYPE html>", self._get(f"/ch/1/{sub}"))
+
+# ─────────────────────────────────────────────
+#  10. Manual status ("Right now" on the schedule page)
+#      CWE-352 CSRF, CWE-20 scene whitelist, schedule left untouched
+# ─────────────────────────────────────────────
+
+class TestManualStatus(unittest.TestCase):
+
+    def setUp(self):
+        import schedule as _schedule
+        import shutil
+        import tempfile
+        self._schedule = _schedule
+        self._tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._tmp, True)
+        p = patch.object(_schedule, "STATUS_FILE",
+                         os.path.join(self._tmp, "manual_status.json"))
+        p.start()
+        self.addCleanup(p.stop)
+        _schedule._cached_status, _schedule._cached_status_mtime = None, 0.0
+        self.addCleanup(setattr, _schedule, "_cached_status", None)
+
+    def _post(self, body: str):
+        return self._post_to("/", body)
+
+    def _post_to(self, path: str, body: str):
+        h = _make_handler("POST", body.encode())
+        h.path = path
+        with patch("web_remote.get_periods", return_value=[]), \
+             patch("web_remote.save_periods") as save:
+            h.do_POST()
+        return h, save, h.wfile.getvalue().decode("utf-8")
+
+    def test_status_on_requires_csrf(self):
+        h, _, _ = self._post("action=status_on&scene=tubby")
+        h.send_response.assert_called_once_with(403)
+        self.assertIsNone(self._schedule.get_manual_status())
+
+    def test_status_off_requires_csrf(self):
+        self._schedule.set_manual_status("tubby")
+        h, _, _ = self._post("action=status_off")
+        h.send_response.assert_called_once_with(403)
+        self.assertIsNotNone(self._schedule.get_manual_status())
+
+    def test_status_on_switches_the_scene_on(self):
+        self._post(f"action=status_on&scene=tubby&csrf={_CSRF_TOKEN}")
+        self.assertEqual(self._schedule.get_manual_status()["scene"], "tubby")
+
+    def test_status_off_hands_back_to_the_schedule(self):
+        self._schedule.set_manual_status("tubby")
+        self._post(f"action=status_off&csrf={_CSRF_TOKEN}")
+        self.assertIsNone(self._schedule.get_manual_status())
+
+    def test_unknown_scene_is_rejected_not_defaulted(self):
+        """A status switches the TV off; an unknown scene must do nothing."""
+        for scene in ("party", "", "<script>", "sleeping%0Ax", "a" * 5000):
+            h, _, _ = self._post(f"action=status_on&scene={scene}&csrf={_CSRF_TOKEN}")
+            h.send_response.assert_called_once_with(200)
+        self.assertIsNone(self._schedule.get_manual_status())
+
+    def test_status_never_saves_the_schedule(self):
+        """The status form has no period fields; it must not wipe the periods."""
+        _, save, _ = self._post(f"action=status_on&scene=tubby&csrf={_CSRF_TOKEN}")
+        save.assert_not_called()
+        _, save, _ = self._post(f"action=status_off&csrf={_CSRF_TOKEN}")
+        save.assert_not_called()
+
+    def test_page_shows_the_active_status_and_an_end_button(self):
+        self._schedule.set_manual_status("tubby")
+        _, _, html = self._post(f"action=noop&csrf={_CSRF_TOKEN}")
+        self.assertIn('value="status_off"', html)
+        self.assertIn("End bath time", html)
+        self.assertIn("stays on until you end it", html)
+
+    def test_status_response_has_security_headers(self):
+        h = _make_handler("POST", f"action=status_on&scene=tubby&csrf={_CSRF_TOKEN}".encode())
+        emitted = {}
+        h.send_header = lambda k, v: emitted.update({k: v})
+        with patch("web_remote.get_periods", return_value=[]):
+            h.do_POST()
+        self.assertIn("script-src 'none'", emitted.get("Content-Security-Policy", ""))
+
+class TestSchedulePause(TestManualStatus):
+    """'Pause schedules' rides on the same override file and handler."""
+
+    def test_pause_requires_csrf(self):
+        h, _, _ = self._post("action=schedules_pause")
+        h.send_response.assert_called_once_with(403)
+        self.assertIsNone(self._schedule.get_schedule_pause())
+
+    def test_resume_requires_csrf(self):
+        self._schedule.pause_schedules()
+        h, _, _ = self._post("action=schedules_resume")
+        h.send_response.assert_called_once_with(403)
+        self.assertIsNotNone(self._schedule.get_schedule_pause())
+
+    def test_pause_and_resume(self):
+        self._post(f"action=schedules_pause&csrf={_CSRF_TOKEN}")
+        self.assertIsNotNone(self._schedule.get_schedule_pause())
+        self._post(f"action=schedules_resume&csrf={_CSRF_TOKEN}")
+        self.assertIsNone(self._schedule.get_schedule_pause())
+
+    def test_pause_never_saves_the_schedule(self):
+        """No period is rewritten, so each period's own Paused flag survives."""
+        _, save, _ = self._post(f"action=schedules_pause&csrf={_CSRF_TOKEN}")
+        save.assert_not_called()
+        _, save, _ = self._post(f"action=schedules_resume&csrf={_CSRF_TOKEN}")
+        save.assert_not_called()
+
+    def test_schedule_checkbox_pauses_and_resumes(self):
+        self._post_to("/schedule", f"action=schedules_pause&csrf={_CSRF_TOKEN}")
+        self.assertIsNotNone(self._schedule.get_schedule_pause())
+        self._post_to("/schedule", f"action=schedules_resume&csrf={_CSRF_TOKEN}")
+        self.assertIsNone(self._schedule.get_schedule_pause())
+
+    def test_schedule_checkbox_requires_csrf(self):
+        h, _, _ = self._post_to("/schedule", "action=schedules_pause")
+        h.send_response.assert_called_once_with(403)
+        self.assertIsNone(self._schedule.get_schedule_pause())
+
+    def test_checkbox_shows_ticked_while_paused(self):
+        self._schedule.pause_schedules()
+        _, _, html = self._post_to("/schedule", f"action=noop&csrf={_CSRF_TOKEN}")
+        self.assertIn('value="schedules_resume"', html)
+        self.assertIn('aria-pressed="true"', html)
+        self.assertNotIn('value="schedules_pause"', html)
+
+    def test_checkbox_shows_unticked_otherwise(self):
+        _, _, html = self._post_to("/schedule", f"action=noop&csrf={_CSRF_TOKEN}")
+        self.assertIn('value="schedules_pause"', html)
+        self.assertIn('aria-pressed="false"', html)
+
+    def test_now_page_says_schedules_are_paused(self):
+        self._schedule.pause_schedules()
+        _, _, html = self._post(f"action=noop&csrf={_CSRF_TOKEN}")
+        self.assertIn("Schedules are paused", html)
+
+    def test_schedule_page_explains_a_status_still_holding_the_tv_off(self):
+        self._schedule.pause_schedules()
+        self._schedule.set_manual_status("tubby")
+        _, _, html = self._post_to("/schedule", f"action=noop&csrf={_CSRF_TOKEN}")
+        self.assertIn("Bath time is on right now", html)
+
+    def test_turn_the_tv_on_pauses_schedules(self):
+        """The Now page's "Turn the TV on" during a scheduled break."""
+        self._post(f"action=schedules_pause&csrf={_CSRF_TOKEN}")
+        self.assertIsNotNone(self._schedule.get_schedule_pause())
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

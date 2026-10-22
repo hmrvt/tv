@@ -13,7 +13,7 @@ import time
 import tkinter as tk
 
 from config import SCENES
-from schedule import next_on_time
+from schedule import back_text
 from pixel_sprites import (draw_pixel_sprite, DEFAULT_PALETTE,
                            ROBOT_SPRITES, ACTIVITY_FRAME_RATE,
                            ACCENT_COLORS, FACE_VARIANTS, ACCESSORIES)
@@ -1194,7 +1194,7 @@ class RobotCanvas(tk.Canvas):
 
     def _draw_text(self, cx, h):
         scene   = SCENES.get(self.scene, SCENES["sleeping"])
-        on_time = next_on_time()
+        back    = back_text()
         is_day  = self.scene != "sleeping"
         # Dark backing panel so text is readable on bright day sky
         if is_day:
@@ -1211,7 +1211,7 @@ class RobotCanvas(tk.Canvas):
                         fill="#00ff88", font=("Courier New", 28, "bold"), anchor="center")
         # Subtext
         self.create_text(cx, h*0.87,
-                        text=f"{scene['sub']}  ·  back at {on_time}",
+                        text=f"{scene['sub']}  ·  {back}",
                         fill="#444466", font=("Courier New", 14), anchor="center")
 
     def _draw_scene(self, cx, cy):

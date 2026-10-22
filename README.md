@@ -125,21 +125,27 @@ Each entry is `(start_hour, start_min, end_hour, end_min, scene)`.
 
 ## Phone remote
 
-Open `http://<your-pc-ip>:8080` from any device on the same Wi-Fi. The landing page shows the off-period schedule and lets you add, edit, or delete entries; changes take effect within 30 seconds. Tap a channel card to manage what that channel is playing.
+Open `http://<your-pc-ip>:8080` from any device on the same Wi-Fi. Three tabs along the bottom, ordered by how often you'll need them:
 
-**Per-channel pages** — each channel has five tabs:
+**Now** (`/`) — what the TV is doing, and the one thing you'd most likely do about it:
+
+| The TV is… | You see |
+|---|---|
+| Playing | The video and its channel, **Skip video**, big **Turn the TV off for…** tiles (bath time, lunch, sleep, Kita, engineers), the next scheduled break, and the three channels. |
+| Off because you switched it (e.g. bath time) | **End bath time**, what happens afterwards, and chips to switch to another scene. A manual status overrides every schedule and survives a restart. |
+| Off on the schedule (e.g. lunch) | When it comes back on and how long is left, and **Turn the TV on** — this pauses all schedules until you resume them on the Schedule tab. |
+
+**Channels** (`/ch/<n>`) — a switcher across the top, then three tabs:
 
 | Tab | What you can do |
 |---|---|
-| **Now playing** (`/ch/<n>`) | **Skip** the current video; **Skip** an upcoming one for this round only; **Remove** a video (moves it to Ignored and deletes its download); **Add to this channel** (plays next, downloads, stays for good); **Play once, then forget** (never downloaded or saved). |
-| **Videos** (`/ch/<n>/videos`) | Every video on the channel, where it came from, and whether it is downloaded. **Remove** moves it to Ignored. |
-| **Ignored** (`/ch/<n>/ignored`) | Videos you removed. **Restore** puts one back, plays it next and downloads it again. |
-| **YouTube playlists** (`/ch/<n>/sources`) | The playlists that feed the channel. **Add playlist** pulls its videos in straight away; **Stop using this playlist** keeps its videos but stops checking it; **Check YouTube playlists for new videos** syncs now instead of waiting. |
-| **Settings** (`/ch/<n>/settings`) | Rename the channel, change its emoji and colour, or **merge** it into another channel (everything moves across; this channel is left empty, ready to reuse). |
+| **Playing** | Skip or remove the current video. Tap an Up next row for **Not this round** (skip it once) or **Remove**. **Add a video** asks one question: *Just this once* (default — plays next, never saved) or *Keep it on this channel* (plays next, downloads, stays). |
+| **Library** (`/ch/<n>/library`) | Every video on the channel, 50 a page, with where it came from and whether it's downloaded. **Removed** lists the ones you took off, each with **Restore**. |
+| **Settings** (`/ch/<n>/settings`) | The YouTube playlists that feed the channel (add, stop using, check now), the name, icon and colour of its TV button, and — collapsed at the bottom — **Merge into another channel**. |
 
-Rows are tagged `SAVED` downloaded, `GETTING` downloading, `STREAM` plays from YouTube, `ONCE` a one-shot injection.
+**Schedule** (`/schedule`) — a **Pause all schedules** checkbox (keeps the TV on; your periods are untouched, so unticking brings back exactly the ones that were enabled), a timeline of today, and the off periods. Tap a period to edit or delete it on its own page; **Add an off period** for a new one. An off period can't cross midnight — add two (e.g. 19:30–23:59 and 00:00–06:50).
 
-> **How YouTube playlists are used:** the app owns each channel's playlist, stored in `channels.json`. Every 30 minutes (and 90 s after start-up) it checks each channel's YouTube playlists and adds any new videos, apart from ones you have ignored. Taking a video out of a playlist on YouTube does **not** remove it from the TV — only the remote does that. The app never writes to YouTube.
+> **How YouTube playlists are used:** the app owns each channel's playlist, stored in `channels.json`. Every 30 minutes (and 90 s after start-up) it checks each channel's YouTube playlists and adds any new videos, apart from ones you have removed. Taking a video out of a playlist on YouTube does **not** remove it from the TV — only the remote does that. The app never writes to YouTube.
 
 The PC's IP address is printed to the console on startup:
 
